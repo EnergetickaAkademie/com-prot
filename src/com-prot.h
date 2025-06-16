@@ -24,6 +24,9 @@ struct SlaveInfo {
 // Command handler function type
 typedef std::function<void(uint8_t* payload, uint16_t length, uint8_t senderId)> CommandHandler;
 
+// Debug receive function type - called on every received message
+typedef std::function<void(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType)> DebugReceiveHandler;
+
 // Master class for managing slave communication
 class ComProtMaster {
 private:
@@ -32,6 +35,7 @@ private:
     uint8_t masterId;
     uint8_t pin;
     unsigned long heartbeatTimeout;
+    DebugReceiveHandler debugHandler;
     
     // Internal methods
     std::vector<SlaveInfo>::iterator findSlave(uint8_t id);
@@ -64,6 +68,10 @@ public:
     void setHeartbeatTimeout(unsigned long timeout);
     uint8_t getMasterId() const;
     size_t getSlaveCount() const;
+    
+    // Debug functionality
+    void setDebugReceiveHandler(DebugReceiveHandler handler);
+    void removeDebugReceiveHandler();
 };
 
 // Slave class for responding to master commands
@@ -76,6 +84,7 @@ private:
     uint8_t masterId;
     unsigned long heartbeatInterval;
     unsigned long lastHeartbeat;
+    DebugReceiveHandler debugHandler;
     
     // Command handlers
     std::vector<std::pair<uint8_t, CommandHandler>> commandHandlers;
@@ -110,6 +119,10 @@ public:
     uint8_t getSlaveId() const;
     uint8_t getSlaveType() const;
     uint8_t getMasterId() const;
+    
+    // Debug functionality
+    void setDebugReceiveHandler(DebugReceiveHandler handler);
+    void removeDebugReceiveHandler();
 };
 
 #endif // COM_PROT_H

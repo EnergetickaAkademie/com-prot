@@ -13,6 +13,25 @@
 // Create master instance
 ComProtMaster master(1, D1); // Master ID 1, pin D1
 
+// Debug receive handler - called for every received message
+void debugReceiveHandler(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType) {
+    Serial.printf("[DEBUG] Received from slave %d, type: 0x%02X, length: %d\n", senderId, messageType, length);
+    
+    // Log to WebSerial as well
+    WebSerial.printf("[DEBUG] RX: Slave=%d, Type=0x%02X, Len=%d\n", senderId, messageType, length);
+    WebSerial.flush();
+    
+    // Optionally print payload data for non-heartbeat messages
+    if (messageType != 0x01 && length > 1) { // Skip heartbeat messages for cleaner output
+        Serial.print("[DEBUG] Payload: ");
+        for (uint16_t i = 0; i < length && i < 16; i++) { // Limit to first 16 bytes
+            Serial.printf("0x%02X ", payload[i]);
+        }
+        if (length > 16) Serial.print("...");
+        Serial.println();
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.println("Com-Prot Master Example");
@@ -28,10 +47,15 @@ void setup() {
     Serial.print("IP address: ");
     Serial.println(WiFi.localIP());
     
+    // Set debug receive handler
+    master.setDebugReceiveHandler(debugReceiveHandler);
+    
     // Initialize the master
     master.begin();
     
-    Serial.println("Com-Prot Master initialized");
+    Serial.println("Com-Prot Master initialized with debug handler");
+    WebSerial.println("Debug receive handler enabled");
+    WebSerial.flush();
 }
 
 void loop() {
@@ -55,24 +79,27 @@ void loop() {
         
         // Example commands:
         
-        // 1. Send LED toggle command (0x10) to all slaves of type 1
+        // 1. Send LED toggle command (0x10) to all slaves of type 1 using broadcast
         if (master.getSlavesByType(1).size() > 0) {
             uint8_t ledState = (millis() / 5000) % 2; // Toggle every 5 seconds
             master.sendCommandToSlaveType(1, 0x10, &ledState, 1);
-            Serial.printf("Sent LED command (%d) to type 1 slaves\n", ledState);
+            Serial.printf("Sent LED broadcast command (%d) to type 1 slaves\n", ledState);
+            WebSerial.printf("LED broadcast to type 1: %s\n", ledState ? "ON" : "OFF");
         }
         
-        // 2. Send temperature request (0x20) to all slaves of type 2
+        // 2. Send temperature request (0x20) to all slaves of type 2 using broadcast
         if (master.getSlavesByType(2).size() > 0) {
             master.sendCommandToSlaveType(2, 0x20);
-            Serial.println("Sent temperature request to type 2 slaves");
+            Serial.println("Sent temperature request broadcast to type 2 slaves");
+            WebSerial.println("Temperature request broadcast to type 2");
         }
         
-        // 3. Send custom command to specific slave ID 10
+        // 3. Send custom command to specific slave ID 10 (unicast)
         if (master.isSlaveConnected(10)) {
             uint8_t customData[] = {0xAA, 0xBB, 0xCC};
             master.sendCommandToSlaveId(10, 0x30, customData, sizeof(customData));
-            Serial.println("Sent custom command to slave 10");
+            Serial.println("Sent custom unicast command to slave 10");
+            WebSerial.println("Custom command sent to slave 10");
         }
         
         lastCommand = millis();

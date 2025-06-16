@@ -46,6 +46,11 @@ void ComProtMaster::handleMessage(uint8_t *payload, uint16_t length, const PJON_
     
     uint8_t messageType = payload[0];
     
+    // Call debug handler if set
+    if (debugHandler) {
+        debugHandler(payload, length, packet_info.tx.id, messageType);
+    }
+    
     switch (messageType) {
         case COM_PROT_HEARTBEAT:
             if (length >= 3) { // messageType + id + type
@@ -115,15 +120,37 @@ bool ComProtMaster::isSlaveConnected(uint8_t id) {
 }
 
 bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command, uint8_t* data, uint16_t dataLen) {
-    bool success = false;
-    
+    // Check if we have any slaves of this type
+    bool hasSlaves = false;
     for (const auto& slave : slaves) {
         if (slave.type == slaveType) {
-            success = sendCommandToSlaveId(slave.id, command, data, dataLen) || success;
+            hasSlaves = true;
+            break;
         }
     }
     
-    return success;
+    if (!hasSlaves) {
+        return false;
+    }
+    
+    // Prepare broadcast message: messageType + slaveType + command + data
+    uint8_t messageLen = 3 + dataLen;
+    uint8_t* message = new uint8_t[messageLen];
+    
+    message[0] = COM_PROT_COMMAND;
+    message[1] = slaveType; // Target slave type for broadcast
+    message[2] = command;
+    
+    if (data && dataLen > 0) {
+        memcpy(&message[3], data, dataLen);
+    }
+    
+    // Use PJON broadcast to send to all devices
+    uint16_t result = bus->send_packet(PJON_BROADCAST, message, messageLen);
+    
+    delete[] message;
+    
+    return result == PJON_ACK;
 }
 
 bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8_t* data, uint16_t dataLen) {
@@ -131,15 +158,16 @@ bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8
         return false;
     }
     
-    // Prepare message: messageType + command + data
-    uint8_t messageLen = 2 + dataLen;
+    // Prepare unicast message: messageType + 0 (no slave type filter) + command + data
+    uint8_t messageLen = 3 + dataLen;
     uint8_t* message = new uint8_t[messageLen];
     
     message[0] = COM_PROT_COMMAND;
-    message[1] = command;
+    message[1] = 0; // 0 means unicast (no type filtering)
+    message[2] = command;
     
     if (data && dataLen > 0) {
-        memcpy(&message[2], data, dataLen);
+        memcpy(&message[3], data, dataLen);
     }
     
     uint16_t result = bus->send(slaveId, message, messageLen);
@@ -159,6 +187,18 @@ uint8_t ComProtMaster::getMasterId() const {
 
 size_t ComProtMaster::getSlaveCount() const {
     return slaves.size();
+}
+
+// ============================================================================
+// Debug Handler Implementations for Master
+// ============================================================================
+
+void ComProtMaster::setDebugReceiveHandler(DebugReceiveHandler handler) {
+    debugHandler = handler;
+}
+
+void ComProtMaster::removeDebugReceiveHandler() {
+    debugHandler = nullptr;
 }
 
 // ============================================================================
@@ -203,22 +243,33 @@ void ComProtSlave::staticReceiver(uint8_t *payload, uint16_t length, const PJON_
 }
 
 void ComProtSlave::handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (length < 2) return;
+    if (length < 1) return;
     
     uint8_t messageType = payload[0];
     
-    if (messageType == COM_PROT_COMMAND) {
-        uint8_t command = payload[1];
+    // Call debug handler if set
+    if (debugHandler) {
+        debugHandler(payload, length, packet_info.tx.id, messageType);
+    }
+    
+    if (messageType == COM_PROT_COMMAND && length >= 3) {
+        uint8_t targetType = payload[1];  // 0 for unicast, specific type for broadcast
+        uint8_t command = payload[2];
         
-        // Find and execute command handler
-        for (const auto& handler : commandHandlers) {
-            if (handler.first == command) {
-                // Extract data portion (everything after messageType and command)
-                uint8_t* data = (length > 2) ? &payload[2] : nullptr;
-                uint16_t dataLen = (length > 2) ? length - 2 : 0;
-                
-                handler.second(data, dataLen, packet_info.tx.id);
-                break;
+        // Check if this message is for us:
+        // - If targetType is 0, it's a unicast message (sent directly to us)
+        // - If targetType matches our slaveType, it's a broadcast for our type
+        if (targetType == 0 || targetType == slaveType) {
+            // Find and execute command handler
+            for (const auto& handler : commandHandlers) {
+                if (handler.first == command) {
+                    // Extract data portion (everything after messageType, targetType, and command)
+                    uint8_t* data = (length > 3) ? &payload[3] : nullptr;
+                    uint16_t dataLen = (length > 3) ? length - 3 : 0;
+                    
+                    handler.second(data, dataLen, packet_info.tx.id);
+                    break;
+                }
             }
         }
     }
@@ -280,4 +331,16 @@ uint8_t ComProtSlave::getSlaveType() const {
 
 uint8_t ComProtSlave::getMasterId() const {
     return masterId;
+}
+
+// ============================================================================
+// Debug Handler Implementations for Slave  
+// ============================================================================
+
+void ComProtSlave::setDebugReceiveHandler(DebugReceiveHandler handler) {
+    debugHandler = handler;
+}
+
+void ComProtSlave::removeDebugReceiveHandler() {
+    debugHandler = nullptr;
 }

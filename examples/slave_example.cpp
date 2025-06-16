@@ -76,6 +76,25 @@ void handleCustomCommand(uint8_t* data, uint16_t length, uint8_t senderId) {
     }
 }
 
+// Debug receive handler - called for every received message
+void debugReceiveHandler(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType) {
+    Serial.printf("[DEBUG] Received from %d, type: 0x%02X, length: %d\n", senderId, messageType, length);
+    
+    // Log to WebSerial as well
+    WebSerial.printf("[DEBUG] RX: ID=%d, Type=0x%02X, Len=%d\n", senderId, messageType, length);
+    WebSerial.flush();
+    
+    // Optionally print payload data
+    if (length > 1) {
+        Serial.print("[DEBUG] Payload: ");
+        for (uint16_t i = 0; i < length && i < 16; i++) { // Limit to first 16 bytes
+            Serial.printf("0x%02X ", payload[i]);
+        }
+        if (length > 16) Serial.print("...");
+        Serial.println();
+    }
+}
+
 void blinkLed() {
     static unsigned long lastBlink = 0;
     static bool blinkState = false;
@@ -119,6 +138,9 @@ void setup() {
     slave.setCommandHandler(0x20, handleTemperatureRequest); // Temperature request
     slave.setCommandHandler(0x30, handleCustomCommand);      // Custom command
     
+    // Set debug receive handler
+    slave.setDebugReceiveHandler(debugReceiveHandler);
+    
     // Initialize the slave
     slave.begin();
     
@@ -129,6 +151,7 @@ void setup() {
     WebSerial.println("  0x10 - LED Control");
     WebSerial.println("  0x20 - Temperature Request");
     WebSerial.println("  0x30 - Custom Command");
+    WebSerial.println("Debug receive handler enabled");
     WebSerial.flush();
     
     Serial.println("Setup complete - sending heartbeats to master");
