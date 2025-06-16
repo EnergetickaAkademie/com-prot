@@ -1,0 +1,43 @@
+#######################################
+# Syntax Coloring Map For com-prot
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+ComProtMaster	KEYWORD1
+ComProtSlave	KEYWORD1
+SlaveInfo	KEYWORD1
+CommandHandler	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+update	KEYWORD2
+sendCommandToSlaveType	KEYWORD2
+sendCommandToSlaveId	KEYWORD2
+getConnectedSlaves	KEYWORD2
+getSlavesByType	KEYWORD2
+isSlaveConnected	KEYWORD2
+setHeartbeatTimeout	KEYWORD2
+getMasterId	KEYWORD2
+getSlaveCount	KEYWORD2
+sendHeartbeat	KEYWORD2
+setHeartbeatInterval	KEYWORD2
+setCommandHandler	KEYWORD2
+removeCommandHandler	KEYWORD2
+sendResponse	KEYWORD2
+getSlaveId	KEYWORD2
+getSlaveType	KEYWORD2
+addOrUpdateSlave	KEYWORD2
+checkSlaveTimeouts	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+COM_PROT_HEARTBEAT	LITERAL1
+COM_PROT_COMMAND	LITERAL1
