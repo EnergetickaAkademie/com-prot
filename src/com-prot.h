@@ -4,7 +4,6 @@
 #include <Arduino.h>
 #include <vector>
 #include <functional>
-#include <algorithm>
 
 #define PJON_INCLUDE_SWBB
 #include <PJONSoftwareBitBang.h>

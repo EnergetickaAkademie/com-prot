@@ -79,15 +79,6 @@ void ComProtBase::calculateAndPrintStats() {
     Serial.println("ms");
 }
 
-unsigned long ComProtBase::calculateMedian(std::vector<unsigned long>& times) {
-    size_t n = times.size();
-    if (n % 2 == 0) {
-        return (times[n/2 - 1] + times[n/2]) / 2;
-    } else {
-        return times[n/2];
-    }
-}
-
 void ComProtBase::setDebugReceiveHandler(DebugReceiveHandler handler) {
     debugHandler = handler;
 }
