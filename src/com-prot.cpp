@@ -5,33 +5,122 @@ ComProtMaster* ComProtMaster::instance = nullptr;
 ComProtSlave* ComProtSlave::instance = nullptr;
 
 // ============================================================================
+// ComProtBase Implementation
+// ============================================================================
+
+ComProtBase::ComProtBase(uint8_t pin) : pin(pin), bus(nullptr), debugHandler(nullptr), 
+    lastReceiveTime(0), lastStatsTime(0), totalReceiveCalls(0), sumIntervals(0), maxInterval(0) {
+}
+
+ComProtBase::~ComProtBase() {
+    if (bus) {
+        delete bus;
+        bus = nullptr;
+    }
+}
+
+void ComProtBase::initializeBus(uint8_t deviceId) {
+    bus = new PJON<SoftwareBitBang>(deviceId);
+}
+
+void ComProtBase::begin() {
+    if (bus) {
+        bus->strategy.set_pin(pin);
+        bus->set_acknowledge(false);
+        bus->set_crc_32(true);
+        bus->set_packet_auto_deletion(true);
+        bus->begin();
+    }
+}
+
+void ComProtBase::receive() {
+    unsigned long currentTime = millis();
+    
+    // Track timing for statistics
+    if (lastReceiveTime > 0) {
+        unsigned long interval = currentTime - lastReceiveTime;
+        sumIntervals += interval;
+        totalReceiveCalls++;
+        
+        if (interval > maxInterval) {
+            maxInterval = interval;
+        }
+    }
+    lastReceiveTime = currentTime;
+    
+    // Call PJON receive
+    if (bus) {
+        bus->receive();
+    }
+    
+    // Print statistics every 5 seconds
+    if (currentTime - lastStatsTime >= 5000) {
+        calculateAndPrintStats();
+        lastStatsTime = currentTime;
+    }
+}
+
+void ComProtBase::calculateAndPrintStats() {
+    if (totalReceiveCalls == 0) {
+        Serial.println("Receive Stats: No data yet");
+        return;
+    }
+    
+    // Calculate average
+    unsigned long average = sumIntervals / totalReceiveCalls;
+    
+    // Print statistics
+    Serial.print("Receive Stats - Count: ");
+    Serial.print(totalReceiveCalls);
+    Serial.print(", Avg: ");
+    Serial.print(average);
+    Serial.print("ms, Max: ");
+    Serial.print(maxInterval);
+    Serial.println("ms");
+}
+
+unsigned long ComProtBase::calculateMedian(std::vector<unsigned long>& times) {
+    size_t n = times.size();
+    if (n % 2 == 0) {
+        return (times[n/2 - 1] + times[n/2]) / 2;
+    } else {
+        return times[n/2];
+    }
+}
+
+void ComProtBase::setDebugReceiveHandler(DebugReceiveHandler handler) {
+    debugHandler = handler;
+}
+
+void ComProtBase::removeDebugReceiveHandler() {
+    debugHandler = nullptr;
+}
+
+// ============================================================================
 // ComProtMaster Implementation
 // ============================================================================
 
 ComProtMaster::ComProtMaster(uint8_t masterId, uint8_t pin, unsigned long heartbeatTimeout) 
-    : masterId(masterId), pin(pin), heartbeatTimeout(heartbeatTimeout) {
-    bus = new PJON<SoftwareBitBang>(masterId);
+    : ComProtBase(pin), masterId(masterId), heartbeatTimeout(heartbeatTimeout) {
+    initializeBus(masterId);
     slaves.reserve(20); // Reserve space for performance
     instance = this;
 }
 
 ComProtMaster::~ComProtMaster() {
-    delete bus;
     instance = nullptr;
 }
 
 void ComProtMaster::begin() {
-    bus->strategy.set_pin(pin);
-    bus->set_receiver(staticReceiver);
-    bus->set_acknowledge(false);
-    bus->set_crc_32(true);
-    bus->set_packet_auto_deletion(true);
-    bus->begin();
+    ComProtBase::begin(); // Call base class begin
+    if (bus) {
+        bus->set_receiver(staticReceiver);
+    }
 }
 
 void ComProtMaster::update() {
     bus->update();
-    bus->receive();
+    receive(); // Use the new receive method from base class
     checkSlaveTimeouts();
 }
 
@@ -146,11 +235,11 @@ bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command, u
     }
     
     // Use PJON broadcast to send to all devices
-    uint16_t result = bus->send_packet(PJON_BROADCAST, message, messageLen);
+    bus->send_packet(PJON_BROADCAST, message, messageLen);
     
     delete[] message;
     
-    return result == PJON_ACK;
+    return true; // Always return true since ACK is disabled
 }
 
 bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8_t* data, uint16_t dataLen) {
@@ -170,11 +259,11 @@ bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8
         memcpy(&message[3], data, dataLen);
     }
     
-    uint16_t result = bus->send(slaveId, message, messageLen);
+    bus->send(slaveId, message, messageLen);
     
     delete[] message;
     
-    return result == PJON_ACK;
+    return true; // Always return true since ACK is disabled
 }
 
 void ComProtMaster::setHeartbeatTimeout(unsigned long timeout) {
@@ -190,44 +279,29 @@ size_t ComProtMaster::getSlaveCount() const {
 }
 
 // ============================================================================
-// Debug Handler Implementations for Master
-// ============================================================================
-
-void ComProtMaster::setDebugReceiveHandler(DebugReceiveHandler handler) {
-    debugHandler = handler;
-}
-
-void ComProtMaster::removeDebugReceiveHandler() {
-    debugHandler = nullptr;
-}
-
-// ============================================================================
 // ComProtSlave Implementation
 // ============================================================================
 
 ComProtSlave::ComProtSlave(uint8_t slaveId, uint8_t slaveType, uint8_t pin, uint8_t masterId, unsigned long heartbeatInterval)
-    : slaveId(slaveId), slaveType(slaveType), pin(pin), masterId(masterId), heartbeatInterval(heartbeatInterval), lastHeartbeat(0) {
-    bus = new PJON<SoftwareBitBang>(slaveId);
+    : ComProtBase(pin), slaveId(slaveId), slaveType(slaveType), masterId(masterId), heartbeatInterval(heartbeatInterval), lastHeartbeat(0) {
+    initializeBus(slaveId);
     instance = this;
 }
 
 ComProtSlave::~ComProtSlave() {
-    delete bus;
     instance = nullptr;
 }
 
 void ComProtSlave::begin() {
-    bus->strategy.set_pin(pin);
-    bus->set_receiver(staticReceiver);
-    bus->set_acknowledge(false);
-    bus->set_crc_32(true);
-    bus->set_packet_auto_deletion(true);
-    bus->begin();
+    ComProtBase::begin(); // Call base class begin
+    if (bus) {
+        bus->set_receiver(staticReceiver);
+    }
 }
 
 void ComProtSlave::update() {
     bus->update();
-    bus->receive();
+    receive(); // Use the new receive method from base class
     
     // Send heartbeat if interval has passed
     if (millis() - lastHeartbeat > heartbeatInterval) {
@@ -314,11 +388,11 @@ bool ComProtSlave::sendResponse(uint8_t commandType, uint8_t* data, uint16_t dat
         memcpy(&message[2], data, dataLen);
     }
     
-    uint16_t result = bus->send(masterId, message, messageLen);
+    bus->send(masterId, message, messageLen);
     
     delete[] message;
     
-    return result == PJON_ACK;
+    return true; // Always return true since ACK is disabled
 }
 
 uint8_t ComProtSlave::getSlaveId() const {
@@ -331,16 +405,4 @@ uint8_t ComProtSlave::getSlaveType() const {
 
 uint8_t ComProtSlave::getMasterId() const {
     return masterId;
-}
-
-// ============================================================================
-// Debug Handler Implementations for Slave  
-// ============================================================================
-
-void ComProtSlave::setDebugReceiveHandler(DebugReceiveHandler handler) {
-    debugHandler = handler;
-}
-
-void ComProtSlave::removeDebugReceiveHandler() {
-    debugHandler = nullptr;
 }

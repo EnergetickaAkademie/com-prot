@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <vector>
 #include <functional>
+#include <algorithm>
 
 #define PJON_INCLUDE_SWBB
 #include <PJONSoftwareBitBang.h>
@@ -27,20 +28,53 @@ typedef std::function<void(uint8_t* payload, uint16_t length, uint8_t senderId)>
 // Debug receive function type - called on every received message
 typedef std::function<void(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType)> DebugReceiveHandler;
 
-// Master class for managing slave communication
-class ComProtMaster {
-private:
+// Abstract base class for common communication functionality
+class ComProtBase {
+protected:
     PJON<SoftwareBitBang>* bus;
+    uint8_t pin;
+    DebugReceiveHandler debugHandler;
+    
+    // Timing statistics
+    unsigned long lastReceiveTime;
+    unsigned long lastStatsTime;
+    unsigned long totalReceiveCalls;
+    unsigned long sumIntervals;
+    unsigned long maxInterval;
+    
+    // Pure virtual methods to be implemented by derived classes
+    virtual void handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) = 0;
+    
+    // Common initialization
+    void initializeBus(uint8_t deviceId);
+    
+    // Statistics calculation
+    void calculateAndPrintStats();
+
+public:
+    ComProtBase(uint8_t pin);
+    virtual ~ComProtBase();
+    
+    // Common methods
+    void begin();
+    void receive();
+    
+    // Debug functionality
+    void setDebugReceiveHandler(DebugReceiveHandler handler);
+    void removeDebugReceiveHandler();
+};
+
+// Master class for managing slave communication
+class ComProtMaster : public ComProtBase {
+private:
     std::vector<SlaveInfo> slaves;
     uint8_t masterId;
-    uint8_t pin;
     unsigned long heartbeatTimeout;
-    DebugReceiveHandler debugHandler;
     
     // Internal methods
     std::vector<SlaveInfo>::iterator findSlave(uint8_t id);
     static void staticReceiver(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info);
-    void handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info);
+    void handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) override;
     
     // Static instance for callback
     static ComProtMaster* instance;
@@ -68,30 +102,23 @@ public:
     void setHeartbeatTimeout(unsigned long timeout);
     uint8_t getMasterId() const;
     size_t getSlaveCount() const;
-    
-    // Debug functionality
-    void setDebugReceiveHandler(DebugReceiveHandler handler);
-    void removeDebugReceiveHandler();
 };
 
 // Slave class for responding to master commands
-class ComProtSlave {
+class ComProtSlave : public ComProtBase {
 private:
-    PJON<SoftwareBitBang>* bus;
     uint8_t slaveId;
     uint8_t slaveType;
-    uint8_t pin;
     uint8_t masterId;
     unsigned long heartbeatInterval;
     unsigned long lastHeartbeat;
-    DebugReceiveHandler debugHandler;
     
     // Command handlers
     std::vector<std::pair<uint8_t, CommandHandler>> commandHandlers;
     
     // Internal methods
     static void staticReceiver(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info);
-    void handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info);
+    void handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) override;
     
     // Static instance for callback
     static ComProtSlave* instance;
@@ -119,10 +146,6 @@ public:
     uint8_t getSlaveId() const;
     uint8_t getSlaveType() const;
     uint8_t getMasterId() const;
-    
-    // Debug functionality
-    void setDebugReceiveHandler(DebugReceiveHandler handler);
-    void removeDebugReceiveHandler();
 };
 
 #endif // COM_PROT_H
