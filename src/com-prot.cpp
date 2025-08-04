@@ -79,6 +79,11 @@ void ComProtBase::calculateAndPrintStats() {
     Serial.print("μs, Max: ");
     Serial.print(maxInterval);
     Serial.println("μs");
+    
+    // Reset statistics for next interval
+    totalReceiveCalls = 0;
+    sumIntervals = 0;
+    maxInterval = 0;
 }
 
 void ComProtBase::setDebugReceiveHandler(DebugReceiveHandler handler) {
