@@ -123,7 +123,6 @@ void ComProtMaster::begin() {
 
 void ComProtMaster::update() {
     bus->update();
-    receive(); // Use the new receive method from base class
     checkSlaveTimeouts();
 }
 
