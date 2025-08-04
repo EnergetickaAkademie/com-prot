@@ -24,7 +24,6 @@ void ComProtBase::initializeBus(uint8_t deviceId) {
 }
 
 void ComProtBase::begin() {
-    std::lock_guard<std::mutex> lock(busMutex);
     if (bus) {
         bus->strategy.set_pin(pin);
         bus->set_acknowledge(false);
@@ -49,17 +48,15 @@ void ComProtBase::receive(unsigned long time) {
     }
     lastReceiveTime = currentTime;
     
-    // Call PJON receive with or without time parameter (thread-safe)
-    {
-        std::lock_guard<std::mutex> lock(busMutex);
-        if (bus) {
-            if (time > 0) {
-                bus->receive(time);
-            } else {
-                bus->receive();
-            }
+    // Call PJON receive with or without time parameter
+    if (bus) {
+        if (time > 0) {
+            bus->receive(time);
+        } else {
+            bus->receive();
         }
     }
+    bus->update(); // Ensure bus is updated after receiving
     
     // Print statistics every 5 seconds (use millis for this check)
     static unsigned long lastMillisCheck = 0;
@@ -119,19 +116,13 @@ ComProtMaster::~ComProtMaster() {
 
 void ComProtMaster::begin() {
     ComProtBase::begin(); // Call base class begin
-    std::lock_guard<std::mutex> lock(busMutex);
     if (bus) {
         bus->set_receiver(staticReceiver);
     }
 }
 
 void ComProtMaster::update() {
-    {
-        std::lock_guard<std::mutex> lock(busMutex);
-        if (bus) {
-            bus->update();
-        }
-    }
+    bus->update();
     receive(); // Use the new receive method from base class
     checkSlaveTimeouts();
 }
@@ -246,13 +237,8 @@ bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command, u
         memcpy(&message[3], data, dataLen);
     }
     
-    // Use PJON broadcast to send to all devices (thread-safe)
-    {
-        std::lock_guard<std::mutex> lock(busMutex);
-        if (bus) {
-            bus->send_packet(PJON_BROADCAST, message, messageLen);
-        }
-    }
+    // Use PJON broadcast to send to all devices
+    bus->send_packet(PJON_BROADCAST, message, messageLen);
     
     delete[] message;
     
@@ -276,13 +262,7 @@ bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8
         memcpy(&message[3], data, dataLen);
     }
     
-    // Send to specific slave (thread-safe)
-    {
-        std::lock_guard<std::mutex> lock(busMutex);
-        if (bus) {
-            bus->send(slaveId, message, messageLen);
-        }
-    }
+    bus->send(slaveId, message, messageLen);
     
     delete[] message;
     
@@ -317,19 +297,14 @@ ComProtSlave::~ComProtSlave() {
 
 void ComProtSlave::begin() {
     ComProtBase::begin(); // Call base class begin
-    std::lock_guard<std::mutex> lock(busMutex);
     if (bus) {
         bus->set_receiver(staticReceiver);
     }
 }
 
 void ComProtSlave::update() {
-    {
-        std::lock_guard<std::mutex> lock(busMutex);
-        if (bus) {
-            bus->update();
-        }
-    }
+    bus->update();
+    
     receive(); // Use the new receive method from base class
     
     // Send heartbeat if interval has passed
@@ -380,10 +355,7 @@ void ComProtSlave::handleMessage(uint8_t *payload, uint16_t length, const PJON_P
 
 void ComProtSlave::sendHeartbeat() {
     uint8_t heartbeat[3] = {COM_PROT_HEARTBEAT, slaveId, slaveType};
-    std::lock_guard<std::mutex> lock(busMutex);
-    if (bus) {
-        bus->send(masterId, heartbeat, sizeof(heartbeat));
-    }
+    bus->send(masterId, heartbeat, sizeof(heartbeat));
 }
 
 void ComProtSlave::setHeartbeatInterval(unsigned long interval) {
@@ -420,13 +392,7 @@ bool ComProtSlave::sendResponse(uint8_t commandType, uint8_t* data, uint16_t dat
         memcpy(&message[2], data, dataLen);
     }
     
-    // Send response to master (thread-safe)
-    {
-        std::lock_guard<std::mutex> lock(busMutex);
-        if (bus) {
-            bus->send(masterId, message, messageLen);
-        }
-    }
+    bus->send(masterId, message, messageLen);
     
     delete[] message;
     

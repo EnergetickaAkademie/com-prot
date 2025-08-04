@@ -4,7 +4,6 @@
 #include <Arduino.h>
 #include <vector>
 #include <functional>
-#include <mutex>
 
 #define PJON_INCLUDE_SWBB
 #include <PJONSoftwareBitBang.h>
@@ -34,7 +33,6 @@ protected:
     PJON<SoftwareBitBang>* bus;
     uint8_t pin;
     DebugReceiveHandler debugHandler;
-    mutable std::mutex busMutex;  // Mutex for thread-safe bus access
     
     // Timing statistics
     unsigned long lastReceiveTime;
