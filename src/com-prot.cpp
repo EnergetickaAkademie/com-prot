@@ -33,7 +33,7 @@ void ComProtBase::begin() {
     }
 }
 
-void ComProtBase::receive() {
+void ComProtBase::receive(unsigned long time) {
     unsigned long currentTime = micros();
     
     // Track timing for statistics
@@ -48,9 +48,13 @@ void ComProtBase::receive() {
     }
     lastReceiveTime = currentTime;
     
-    // Call PJON receive
+    // Call PJON receive with or without time parameter
     if (bus) {
-        bus->receive();
+        if (time > 0) {
+            bus->receive(time);
+        } else {
+            bus->receive();
+        }
     }
     
     // Print statistics every 5 seconds (use millis for this check)

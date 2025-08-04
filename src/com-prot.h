@@ -55,7 +55,7 @@ public:
     
     // Common methods
     void begin();
-    void receive();
+    void receive(unsigned long time = 0);
     
     // Debug functionality
     void setDebugReceiveHandler(DebugReceiveHandler handler);
