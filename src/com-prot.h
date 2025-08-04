@@ -36,7 +36,6 @@ protected:
     
     // Timing statistics
     unsigned long lastReceiveTime;
-    unsigned long lastStatsTime;
     unsigned long totalReceiveCalls;
     unsigned long sumIntervals;
     unsigned long maxInterval;

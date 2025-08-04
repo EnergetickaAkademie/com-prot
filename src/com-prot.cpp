@@ -9,7 +9,7 @@ ComProtSlave* ComProtSlave::instance = nullptr;
 // ============================================================================
 
 ComProtBase::ComProtBase(uint8_t pin) : pin(pin), bus(nullptr), debugHandler(nullptr), 
-    lastReceiveTime(0), lastStatsTime(0), totalReceiveCalls(0), sumIntervals(0), maxInterval(0) {
+    lastReceiveTime(0), totalReceiveCalls(0), sumIntervals(0), maxInterval(0) {
 }
 
 ComProtBase::~ComProtBase() {
@@ -34,7 +34,7 @@ void ComProtBase::begin() {
 }
 
 void ComProtBase::receive() {
-    unsigned long currentTime = millis();
+    unsigned long currentTime = micros();
     
     // Track timing for statistics
     if (lastReceiveTime > 0) {
@@ -53,10 +53,12 @@ void ComProtBase::receive() {
         bus->receive();
     }
     
-    // Print statistics every 5 seconds
-    if (currentTime - lastStatsTime >= 5000) {
+    // Print statistics every 5 seconds (use millis for this check)
+    static unsigned long lastMillisCheck = 0;
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastMillisCheck >= 5000) {
         calculateAndPrintStats();
-        lastStatsTime = currentTime;
+        lastMillisCheck = currentMillis;
     }
 }
 
@@ -74,9 +76,9 @@ void ComProtBase::calculateAndPrintStats() {
     Serial.print(totalReceiveCalls);
     Serial.print(", Avg: ");
     Serial.print(average);
-    Serial.print("ms, Max: ");
+    Serial.print("μs, Max: ");
     Serial.print(maxInterval);
-    Serial.println("ms");
+    Serial.println("μs");
 }
 
 void ComProtBase::setDebugReceiveHandler(DebugReceiveHandler handler) {
