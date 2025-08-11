@@ -62,14 +62,12 @@ void ComProtBase::receive(unsigned long time) {
     static unsigned long lastMillisCheck = 0;
     unsigned long currentMillis = millis();
     if (currentMillis - lastMillisCheck >= 5000) {
-        calculateAndPrintStats();
         lastMillisCheck = currentMillis;
     }
 }
 
 void ComProtBase::calculateAndPrintStats() {
     if (totalReceiveCalls == 0) {
-        Serial.println("Receive Stats: No data yet");
         return;
     }
     
