@@ -49,21 +49,10 @@ void ComProtBase::receive(unsigned long time) {
     lastReceiveTime = currentTime;
     
     // Call PJON receive with or without time parameter
-    if (bus) {
-        if (time > 0) {
-            bus->receive(time);
-        } else {
-            bus->receive();
-        }
-    }
+    if (time > 0) bus->receive(time);
+    else          bus->receive();
     bus->update(); // Ensure bus is updated after receiving
     
-    // Print statistics every 5 seconds (use millis for this check)
-    static unsigned long lastMillisCheck = 0;
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastMillisCheck >= 5000) {
-        lastMillisCheck = currentMillis;
-    }
 }
 
 void ComProtBase::calculateAndPrintStats() {
@@ -207,63 +196,41 @@ std::vector<SlaveInfo> ComProtMaster::getSlavesByType(uint8_t type) {
 bool ComProtMaster::isSlaveConnected(uint8_t id) {
     return findSlave(id) != slaves.end();
 }
+bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command,
+                                           uint8_t* data, uint16_t dataLen) {
+  // small stack buffer to avoid heap fragmentation
+  uint8_t msg[32];
+  uint16_t len = 3 + dataLen;
+  if (len > sizeof(msg)) return false;
 
-bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command, uint8_t* data, uint16_t dataLen) {
-    // Check if we have any slaves of this type
-    bool hasSlaves = false;
-    for (const auto& slave : slaves) {
-        if (slave.type == slaveType) {
-            hasSlaves = true;
-            break;
-        }
-    }
-    
-    if (!hasSlaves) {
-        return false;
-    }
-    
-    // Prepare broadcast message: messageType + slaveType + command + data
-    uint8_t messageLen = 3 + dataLen;
-    uint8_t* message = new uint8_t[messageLen];
-    
-    message[0] = COM_PROT_COMMAND;
-    message[1] = slaveType; // Target slave type for broadcast
-    message[2] = command;
-    
-    if (data && dataLen > 0) {
-        memcpy(&message[3], data, dataLen);
-    }
-    
-    // Use PJON broadcast to send to all devices
-    bus->send_packet(PJON_BROADCAST, message, messageLen);
-    
-    delete[] message;
-    
-    return true; // Always return true since ACK is disabled
+  msg[0] = COM_PROT_COMMAND;
+  msg[1] = slaveType;     // target type for broadcast
+  msg[2] = command;
+  if (data && dataLen) memcpy(&msg[3], data, dataLen);
+
+  // queue for retry in update()
+  uint16_t pid = bus->send(PJON_BROADCAST, msg, len);
+  if (pid == PJON_FAIL) {
+    // buffer full; caller can retry later
+    return false;
+  }
+  return true;
 }
 
-bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8_t* data, uint16_t dataLen) {
-    if (!isSlaveConnected(slaveId)) {
-        return false;
-    }
-    
-    // Prepare unicast message: messageType + 0 (no slave type filter) + command + data
-    uint8_t messageLen = 3 + dataLen;
-    uint8_t* message = new uint8_t[messageLen];
-    
-    message[0] = COM_PROT_COMMAND;
-    message[1] = 0; // 0 means unicast (no type filtering)
-    message[2] = command;
-    
-    if (data && dataLen > 0) {
-        memcpy(&message[3], data, dataLen);
-    }
-    
-    bus->send(slaveId, message, messageLen);
-    
-    delete[] message;
-    
-    return true; // Always return true since ACK is disabled
+
+bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command,
+                                         uint8_t* data, uint16_t dataLen) {
+  uint8_t msg[32];
+  uint16_t len = 3 + dataLen;
+  if (len > sizeof(msg)) return false;
+
+  msg[0] = COM_PROT_COMMAND;
+  msg[1] = 0;             // 0 ⇒ unicast
+  msg[2] = command;
+  if (data && dataLen) memcpy(&msg[3], data, dataLen);
+
+  uint16_t pid = bus->send(slaveId, msg, len);
+  return pid != PJON_FAIL;
 }
 
 void ComProtMaster::setHeartbeatTimeout(unsigned long timeout) {
