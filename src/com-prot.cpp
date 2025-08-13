@@ -280,7 +280,7 @@ void ComProtSlave::update() {
     bus->update();
     
     // Receive with short timeout to avoid blocking
-    receive(100); // 100 microseconds timeout
+    receive(10); // 100 microseconds timeout
     
     // Send heartbeat if interval has passed
     unsigned long currentTime = millis();
