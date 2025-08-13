@@ -110,7 +110,17 @@ void ComProtMaster::begin() {
 
 void ComProtMaster::update() {
     bus->update();
-    checkSlaveTimeouts();
+    
+    // Receive with short timeout
+    receive(); // 100 microseconds timeout
+    
+    // Check for slave timeouts periodically (every 500ms)
+    static unsigned long lastTimeoutCheck = 0;
+    unsigned long currentTime = millis();
+    if (currentTime - lastTimeoutCheck > 500) {
+        checkSlaveTimeouts();
+        lastTimeoutCheck = currentTime;
+    }
 }
 
 void ComProtMaster::staticReceiver(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
@@ -208,7 +218,7 @@ bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command,
   msg[2] = command;
   if (data && dataLen) memcpy(&msg[3], data, dataLen);
 
-  // queue for retry in update()
+  // Try to send with retry
   uint16_t pid = bus->send(PJON_BROADCAST, msg, len);
   if (pid == PJON_FAIL) {
     // buffer full; caller can retry later
@@ -269,12 +279,14 @@ void ComProtSlave::begin() {
 void ComProtSlave::update() {
     bus->update();
     
-    receive(); // Use the new receive method from base class
+    // Receive with short timeout to avoid blocking
+    receive(100); // 100 microseconds timeout
     
     // Send heartbeat if interval has passed
-    if (millis() - lastHeartbeat > heartbeatInterval) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastHeartbeat > heartbeatInterval) {
         sendHeartbeat();
-        lastHeartbeat = millis();
+        lastHeartbeat = currentTime;
     }
 }
 
