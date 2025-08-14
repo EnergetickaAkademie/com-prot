@@ -8,7 +8,7 @@ ComProtSlave* ComProtSlave::instance = nullptr;
 // ComProtBase Implementation
 // ============================================================================
 
-ComProtBase::ComProtBase(uint8_t pin) : pin(pin), bus(nullptr), debugHandler(nullptr), 
+ComProtBase::ComProtBase() : bus(nullptr), debugHandler(nullptr), 
     lastReceiveTime(0), totalReceiveCalls(0), sumIntervals(0), maxInterval(0) {
 }
 
@@ -20,12 +20,13 @@ ComProtBase::~ComProtBase() {
 }
 
 void ComProtBase::initializeBus(uint8_t deviceId) {
-    bus = new PJON<SoftwareBitBang>(deviceId);
+    bus = new PJON<ThroughSerialAsync>(deviceId);
 }
 
 void ComProtBase::begin() {
     if (bus) {
-        bus->strategy.set_pin(pin);
+        Serial.begin(9600);  // Initialize UART at 9600 baud
+        bus->strategy.set_serial(&Serial);
         bus->set_acknowledge(false);
         bus->set_crc_32(true);
         bus->set_packet_auto_deletion(true);
@@ -90,8 +91,8 @@ void ComProtBase::removeDebugReceiveHandler() {
 // ComProtMaster Implementation
 // ============================================================================
 
-ComProtMaster::ComProtMaster(uint8_t masterId, uint8_t pin, unsigned long heartbeatTimeout) 
-    : ComProtBase(pin), masterId(masterId), heartbeatTimeout(heartbeatTimeout) {
+ComProtMaster::ComProtMaster(uint8_t masterId, unsigned long heartbeatTimeout) 
+    : ComProtBase(), masterId(masterId), heartbeatTimeout(heartbeatTimeout) {
     initializeBus(masterId);
     slaves.reserve(20); // Reserve space for performance
     instance = this;
@@ -259,8 +260,8 @@ size_t ComProtMaster::getSlaveCount() const {
 // ComProtSlave Implementation
 // ============================================================================
 
-ComProtSlave::ComProtSlave(uint8_t slaveId, uint8_t slaveType, uint8_t pin, uint8_t masterId, unsigned long heartbeatInterval)
-    : ComProtBase(pin), slaveId(slaveId), slaveType(slaveType), masterId(masterId), heartbeatInterval(heartbeatInterval), lastHeartbeat(0) {
+ComProtSlave::ComProtSlave(uint8_t slaveId, uint8_t slaveType, uint8_t masterId, unsigned long heartbeatInterval)
+    : ComProtBase(), slaveId(slaveId), slaveType(slaveType), masterId(masterId), heartbeatInterval(heartbeatInterval), lastHeartbeat(0) {
     initializeBus(slaveId);
     instance = this;
 }

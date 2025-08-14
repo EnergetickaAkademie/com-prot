@@ -5,9 +5,8 @@
 #include <vector>
 #include <functional>
 
-#define PJON_INCLUDE_SWBB
-#include <PJONSoftwareBitBang.h>
-
+#define PJON_INCLUDE_TSA
+#include <PJON.h>
 // Protocol message types
 #define COM_PROT_HEARTBEAT 0x03
 #define COM_PROT_COMMAND   0x04
@@ -30,8 +29,7 @@ typedef std::function<void(uint8_t* payload, uint16_t length, uint8_t senderId, 
 // Abstract base class for common communication functionality
 class ComProtBase {
 protected:
-    PJON<SoftwareBitBang>* bus;
-    uint8_t pin;
+    PJON<ThroughSerialAsync>* bus;
     DebugReceiveHandler debugHandler;
     
     // Timing statistics
@@ -50,7 +48,7 @@ protected:
     void calculateAndPrintStats();
 
 public:
-    ComProtBase(uint8_t pin);
+    ComProtBase();
     virtual ~ComProtBase();
     
     // Common methods
@@ -78,7 +76,7 @@ private:
     static ComProtMaster* instance;
 
 public:
-    ComProtMaster(uint8_t masterId, uint8_t pin, unsigned long heartbeatTimeout = 3100);
+    ComProtMaster(uint8_t masterId, unsigned long heartbeatTimeout = 3100);
     ~ComProtMaster();
     
     // Initialization
@@ -122,7 +120,7 @@ private:
     static ComProtSlave* instance;
 
 public:
-    ComProtSlave(uint8_t slaveId, uint8_t slaveType, uint8_t pin, uint8_t masterId = 1, unsigned long heartbeatInterval = 1000);
+    ComProtSlave(uint8_t slaveId, uint8_t slaveType, uint8_t masterId = 1, unsigned long heartbeatInterval = 1000);
     ~ComProtSlave();
     
     // Initialization

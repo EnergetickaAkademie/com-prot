@@ -1,8 +1,8 @@
 /*
- * Slave Example using Com-Prot Library
+ * Slave Example using Com-Prot Library with UART ThroughSerialAsync
  * 
- * This example shows how to replace the existing OneWireSlave implementation
- * with the Com-Prot library for simplified slave functionality.
+ * This example shows how to use the Com-Prot library with PJON's
+ * ThroughSerialAsync strategy for reliable UART communication at 9600 baud.
  */
 
 #include <Arduino.h>
@@ -23,8 +23,8 @@
 #define DEVICE_NAME "ComProtSlave"  // Default fallback
 #endif
 
-// Create slave instance
-ComProtSlave slave(SLAVE_ID, SLAVE_TYPE, D1); // Use build flags for ID and type
+// Create slave instance (no pin needed for UART)
+ComProtSlave slave(SLAVE_ID, SLAVE_TYPE); // Use build flags for ID and type
 
 // LED control
 constexpr uint8_t pin_led{LED_BUILTIN};
@@ -36,7 +36,7 @@ void handleLedCommand(uint8_t* data, uint16_t length, uint8_t senderId) {
         bool ledState = data[0];
         digitalWrite(pin_led, ledState ? LOW : HIGH); // LED is inverted on ESP8266
         
-        Serial.printf("LED turned %s by master %d\n", ledState ? "ON" : "OFF", senderId);
+        Serial1.printf("LED turned %s by master %d\n", ledState ? "ON" : "OFF", senderId);
         
         WebSerial.printf("LED command received: %s\n", ledState ? "ON" : "OFF");
         WebSerial.flush();
@@ -47,7 +47,7 @@ void handleTemperatureRequest(uint8_t* data, uint16_t length, uint8_t senderId) 
     // Simulate temperature reading
     float temperature = 20.0 + (millis() % 10000) / 1000.0; // 20-30°C range
     
-    Serial.printf("Temperature request from master %d, sending: %.2f°C\n", senderId, temperature);
+    Serial1.printf("Temperature request from master %d, sending: %.2f°C\n", senderId, temperature);
     
     // Send response back to master
     uint8_t response[4];
@@ -59,14 +59,14 @@ void handleTemperatureRequest(uint8_t* data, uint16_t length, uint8_t senderId) 
 }
 
 void handleCustomCommand(uint8_t* data, uint16_t length, uint8_t senderId) {
-    Serial.printf("Custom command from master %d, data length: %d\n", senderId, length);
+    Serial1.printf("Custom command from master %d, data length: %d\n", senderId, length);
     
     if (length > 0) {
-        Serial.print("Data: ");
+        Serial1.print("Data: ");
         for (uint16_t i = 0; i < length; i++) {
-            Serial.printf("0x%02X ", data[i]);
+            Serial1.printf("0x%02X ", data[i]);
         }
-        Serial.println();
+        Serial1.println();
         
         // Start LED blinking for 5 seconds
         ledBlinking = true;
@@ -78,7 +78,7 @@ void handleCustomCommand(uint8_t* data, uint16_t length, uint8_t senderId) {
 
 // Debug receive handler - called for every received message
 void debugReceiveHandler(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType) {
-    Serial.printf("[DEBUG] Received from %d, type: 0x%02X, length: %d\n", senderId, messageType, length);
+    Serial1.printf("[DEBUG] Received from %d, type: 0x%02X, length: %d\n", senderId, messageType, length);
     
     // Log to WebSerial as well
     WebSerial.printf("[DEBUG] RX: ID=%d, Type=0x%02X, Len=%d\n", senderId, messageType, length);
@@ -86,12 +86,12 @@ void debugReceiveHandler(uint8_t* payload, uint16_t length, uint8_t senderId, ui
     
     // Optionally print payload data
     if (length > 1) {
-        Serial.print("[DEBUG] Payload: ");
+        Serial1.print("[DEBUG] Payload: ");
         for (uint16_t i = 0; i < length && i < 16; i++) { // Limit to first 16 bytes
-            Serial.printf("0x%02X ", payload[i]);
+            Serial1.printf("0x%02X ", payload[i]);
         }
-        if (length > 16) Serial.print("...");
-        Serial.println();
+        if (length > 16) Serial1.print("...");
+        Serial1.println();
     }
 }
 
@@ -116,10 +116,11 @@ void blinkLed() {
 }
 
 void setup() {
-    Serial.begin(115200);
-    Serial.println("Com-Prot Slave Example");
-    Serial.flush();
-    Serial.println("Booting");
+    // Use Serial1 for debug output since Serial is used for PJON communication
+    Serial1.begin(115200);
+    Serial1.println("Com-Prot Slave Example - UART ThroughSerialAsync");
+    Serial1.flush();
+    Serial1.println("Booting");
     
     pinMode(pin_led, OUTPUT);
     digitalWrite(pin_led, HIGH); // Turn off LED initially (inverted)
@@ -129,9 +130,9 @@ void setup() {
     setupOTA(-1, DEVICE_NAME);
     setupWebSerial(DEVICE_NAME);
 
-    Serial.println("Ready");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
+    Serial1.println("Ready");
+    Serial1.print("IP address: ");
+    Serial1.println(WiFi.localIP());
     
     // Register command handlers
     slave.setCommandHandler(0x10, handleLedCommand);        // LED control
@@ -141,12 +142,14 @@ void setup() {
     // Set debug receive handler
     slave.setDebugReceiveHandler(debugReceiveHandler);
     
-    // Initialize the slave
+    // Initialize the slave (this will setup Serial for PJON at 9600 baud)
     slave.begin();
     
-    Serial.printf("Com-Prot Slave initialized - ID: %d, Type: %d\n", SLAVE_ID, SLAVE_TYPE);
+    Serial1.printf("Com-Prot Slave initialized - ID: %d, Type: %d\n", SLAVE_ID, SLAVE_TYPE);
+    Serial1.println("UART ThroughSerialAsync initialized at 9600 baud");
     
     WebSerial.printf("Slave ID: %d, Type: %d\n", SLAVE_ID, SLAVE_TYPE);
+    WebSerial.println("UART ThroughSerialAsync at 9600 baud");
     WebSerial.println("Command handlers registered:");
     WebSerial.println("  0x10 - LED Control");
     WebSerial.println("  0x20 - Temperature Request");
@@ -154,7 +157,7 @@ void setup() {
     WebSerial.println("Debug receive handler enabled");
     WebSerial.flush();
     
-    Serial.println("Setup complete - sending heartbeats to master");
+    Serial1.println("Setup complete - sending heartbeats to master");
 }
 
 void loop() {
