@@ -8,13 +8,12 @@ extern "C" {
   #include "user_interface.h"
 }
 
-// Timer1: CPU / 16 ticks per second
-// cpu (MHz) = 80 or 160; ticksPerUs = cpu/16 (5 or 10)
+// Timer1 ticks: CPU/16 per microsecond base
 static inline uint32_t ticks_per_us() { return (uint32_t)(system_get_cpu_freq() / 16); }
 static inline uint32_t cell_ticks_us(uint16_t us) {
   uint32_t tpu = ticks_per_us();
   uint32_t ticks = (uint32_t)us * (tpu ? tpu : 5);
-  if (ticks < 2) ticks = 2; // guard against zero / too fast
+  if (ticks < 2) ticks = 2;
   return ticks;
 }
 
@@ -39,7 +38,7 @@ ComProtMaster::~ComProtMaster() {
 void ComProtMaster::begin() {
   pinMode(CLK, OUTPUT);
   digitalWrite(CLK, LOW);
-  data_release(DATA); // idle HIGH via pull-up
+  data_release(DATA);
   self = this;
   startTicker();
 }
@@ -49,8 +48,8 @@ void ComProtMaster::startTicker() {
   ticking = true;
   timer1_isr_init();
   timer1_attachInterrupt(onTickISR);
-  // TIM_DIV16 => tick = 1/(CPU/16) us; we want one ISR per HALF cell => rising edges every cell
   timer1_enable(TIM_DIV16, TIM_EDGE, TIM_LOOP);
+  // generate one rising edge per cell: toggle at half-cell
   uint16_t halfCellUs = (cellUs >= 2) ? (cellUs / 2) : 1;
   timer1_write(cell_ticks_us(halfCellUs));
 }
@@ -61,8 +60,8 @@ void ComProtMaster::stopTicker() {
   ticking = false;
 }
 
-// Build: SYNC(15) + payload(24 cells) + GUARD("11")
-void ComProtMaster::buildFrameAndKick(uint8_t mtype, uint8_t A6, uint8_t cmd4) {
+// Build: SYNC(15) + payload(24) + GUARD("11"); choose response mode
+void ComProtMaster::buildFrameAndKick(uint8_t mtype, uint8_t A6, uint8_t cmd4, RespMode rm) {
   uint16_t bits12 = pack12(mtype, A6, cmd4);
   uint8_t payload[24];
   encode12_to_24cells(bits12, payload);
@@ -70,29 +69,41 @@ void ComProtMaster::buildFrameAndKick(uint8_t mtype, uint8_t A6, uint8_t cmd4) {
   uint16_t i=0;
   for (uint8_t k=0;k<SYNC_LEN;++k) txCells[i++] = SYNC_PATTERN[k];
   for (uint8_t k=0;k<24;++k)       txCells[i++] = payload[k];
-  // GUARD "11"
-  txCells[i++] = 1;
-  txCells[i++] = 1;
+  txCells[i++] = 1; txCells[i++] = 1; // GUARD
 
   txLen = i;
   cellIdx = 0;
-  respSampleIdx = 0;
-  inRespWindow = false;
 
-  if (mtype == POLL_ID) currentlyPollingId = (A6 & 0x3F);
-  else                  currentlyPollingId = 0xFF;
+  respMode = rm;
+  respNeed = (rm==RESP_PRESENCE2 ? 2 : (rm==RESP_TYPE12 ? 12 : 0));
+  respHave = 0;
+
+  if (mtype == POLL_ID) {
+    currentlyPollingId = (A6 & 0x3F);
+  } else {
+    currentlyPollingId = 0xFF;
+  }
+}
+
+void ComProtMaster::schedulePollIfIdle() {
+  if (respNeed==0 && cellIdx >= txLen) {
+    uint8_t id = scanNextId;
+    buildFrameAndKick(POLL_ID, id, 0, RESP_PRESENCE2);
+    scanNextId = (scanNextId + 1) & 0x3F;
+  }
+}
+
+void ComProtMaster::scheduleWhoIfNeeded() {
+  // if we have unknown type detected recently, schedule WHO
+  if (pendingWhoId != 0xFF && respNeed==0 && cellIdx >= txLen) {
+    uint8_t id = pendingWhoId;
+    pendingWhoId = 0xFF;
+    buildFrameAndKick(CMD_TO_ID, id, CMD_WHOAREYOU, RESP_TYPE12);
+  }
 }
 
 void ComProtMaster::update() {
-  // schedule next poll if idle
-  if (!inRespWindow && (cellIdx >= txLen)) {
-    // round-robin POLL
-    uint8_t id = scanNextId;
-    buildFrameAndKick(POLL_ID, id, 0);
-    scanNextId = (scanNextId + 1) & 0x3F;
-  }
-
-  // consume presence event from ISR
+  // 1) consume presence event
   if (presenceEvtPending) {
     noInterrupts();
     uint8_t id   = presenceEvtId;
@@ -100,41 +111,90 @@ void ComProtMaster::update() {
     presenceEvtPending = false;
     interrupts();
 
-    if (currentlyPollingId != 0xFF && id == currentlyPollingId) {
-      handlePresenceResult(id, yes);
+    if (yes) {
+      handlePresenceResult(id, true);
+      // if type unknown, schedule WHO
+      auto it = findSlave(id);
+      if (it != slaves.end() && it->type == 0xFF) pendingWhoId = id;
     }
+    // NO -> nic, timeout to vyčistí
   }
 
+  // 2) consume type event
+  if (typeEvtPending) {
+    noInterrupts();
+    uint8_t id = typeEvtId;
+    uint8_t tp = typeEvtVal;
+    typeEvtPending = false;
+    interrupts();
+    handleTypeResult(id, tp);
+  }
+
+  // 3) prefer WHO over POLL when idle
+  scheduleWhoIfNeeded();
+  schedulePollIfIdle();
+
+  // 4) timeouts
   checkTimeouts();
 }
 
-// ISR: toggle CLK each half-cell; act on rising edges (one per cell)
 void IRAM_ATTR ComProtMaster::onTickISR() {
   if (!self) return;
   static bool clkHigh = false;
   clkHigh = !clkHigh;
   digitalWrite(self->CLK, clkHigh ? HIGH : LOW);
-  if (!clkHigh) return; // only on rising
+  if (!clkHigh) return; // act on rising edge (one per cell)
 
   if (self->cellIdx < self->txLen) {
     uint8_t b = self->txCells[self->cellIdx++];
     if (b) { data_release(self->DATA); } else { data_drive0(self->DATA); }
     if (self->cellIdx >= self->txLen) {
-      // finished payload+guard -> release for response window
+      // payload+guard done -> release for response window if any
       data_release(self->DATA);
-      self->inRespWindow = true;
-      self->respSampleIdx = 0;
     }
-  } else if (self->inRespWindow) {
-    if (self->respSampleIdx < 2) {
-      self->respSample[self->respSampleIdx++] = data_read(self->DATA) ? 1 : 0;
-      if (self->respSampleIdx >= 2) {
-        self->inRespWindow = false;
-        bool present = (self->respSample[0]==0 && self->respSample[1]==0);
-        // Defer vector updates to main loop
-        self->presenceEvtId = (self->currentlyPollingId == 0xFF) ? 0 : self->currentlyPollingId;
-        self->presenceEvtYes = present ? 1 : 0;
-        self->presenceEvtPending = true;
+  } else if (self->respNeed) {
+    // read response cells
+    if (self->respHave < self->respNeed) {
+      self->respCells[self->respHave++] = data_read(self->DATA) ? 1 : 0;
+      if (self->respHave >= self->respNeed) {
+        // response complete
+        if (self->respMode == RESP_PRESENCE2) {
+          bool present = (self->respCells[0]==0 && self->respCells[1]==0);
+          if (self->currentlyPollingId != 0xFF) {
+            self->presenceEvtId = self->currentlyPollingId;
+            self->presenceEvtYes = present ? 1 : 0;
+            self->presenceEvtPending = true;
+          }
+        } else if (self->respMode == RESP_TYPE12) {
+          // decode 6 bits from dibits
+          uint8_t t = 0;
+          bool ok = true;
+          for (int i=0;i<12;i+=2) {
+            uint8_t a = self->respCells[i];
+            uint8_t b = self->respCells[i+1];
+            if (a!=b) { ok=false; break; }
+            t = (uint8_t)((t<<1) | (a?1:0));
+          }
+          if (ok) {
+            self->typeEvtId = 0; // unknown which id exactly (we sent to pendingWhoId)
+            // we can cache last sent WHO id in currentlyPollingId? safer: store last WHO target in presenceEvtId? 
+            // Simpler: for WHO we set currentlyPollingId=0xFF -> we carry id in pendingWhoId at build time.
+            // Save it here using a shadow variable: we don't have it; so set it via a static.
+          }
+          // To keep ID, store it when we build WHO frame:
+          // We'll reuse 'presenceEvtId' field temporarily:
+          // write id before kicking:
+          // (already handled in buildFrameAndKick via currentlyPollingId=0xFF; so we need another volatile to carry WHO id)
+          // Let's read it here:
+          uint8_t whoId = self->presenceEvtId; // set in buildFrameAndKick for WHO
+          self->typeEvtId  = whoId;
+          self->typeEvtVal = t;
+          self->typeEvtPending = true;
+        }
+        // reset resp
+        self->respNeed = 0;
+        self->respHave = 0;
+        self->respMode = RESP_NONE;
       }
     }
   }
@@ -148,8 +208,16 @@ void ComProtMaster::handlePresenceResult(uint8_t polledId, bool present) {
     } else {
       it->lastSeenMs = millis();
     }
+  }
+}
+
+void ComProtMaster::handleTypeResult(uint8_t id, uint8_t type) {
+  auto it = findSlave(id);
+  if (it == slaves.end()) {
+    slaves.push_back({id, type & 0x3F, millis()});
   } else {
-    // nothing; timeout will prune
+    it->type = (type & 0x3F);
+    it->lastSeenMs = millis();
   }
 }
 
@@ -177,13 +245,23 @@ std::vector<SlaveInfo> ComProtMaster::getSlavesByType(uint8_t type) {
 bool ComProtMaster::isSlaveConnected(uint8_t id) { return findSlave(id) != slaves.end(); }
 
 bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t cmd) {
-  buildFrameAndKick(CMD_TO_TYPE, slaveType & 0x3F, cmd & 0x0F);
+  buildFrameAndKick(CMD_TO_TYPE, slaveType & 0x3F, cmd & 0x0F, RESP_NONE);
   return true;
 }
 
 bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t cmd) {
-  buildFrameAndKick(CMD_TO_ID, slaveId & 0x3F, cmd & 0x0F);
+  buildFrameAndKick(CMD_TO_ID, slaveId & 0x3F, cmd & 0x0F, RESP_NONE);
   return true;
+}
+
+bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command, uint8_t* data, uint16_t dataLen) {
+  if (dataLen > 0) return false; // payload not supported on this wire (4-bit only)
+  return sendCommandToSlaveType(slaveType, command & 0x0F);
+}
+
+bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8_t* data, uint16_t dataLen) {
+  if (dataLen > 0) return false;
+  return sendCommandToSlaveId(slaveId, command & 0x0F);
 }
 
 // ===================== Slave =====================
@@ -204,21 +282,23 @@ ComProtSlave::~ComProtSlave() {
 }
 
 void ComProtSlave::begin() {
-  pinMode(DATA, INPUT); // release
+  pinMode(DATA, INPUT);
   pinMode(CLK, INPUT);
   rxState = RX_WAIT_SYNC;
   syncWindow = 0;
   recvIdx = 0;
   postCount = 0;
-  expectReplyWindow = false;
-  mustReplyYes = false;
+  expectPresenceReply = false;
+  expectTypeReply = false;
+  typeReplyLen = 0;
+  typeReplyIdx = 0;
 
   self = this;
   attachInterrupt(digitalPinToInterrupt(CLK), onClkRiseISR, RISING);
 }
 
 void ComProtSlave::update() {
-  // no periodic work; replies handled inside ISR in RESP window
+  // nothing periodic
 }
 
 void ComProtSlave::setCommandHandler(uint8_t cmdType, CommandHandler h) {
@@ -239,10 +319,10 @@ bool ComProtSlave::matchSYNC(uint16_t w) {
 
 uint8_t ComProtSlave::decode12_from_24cells(const volatile uint8_t *cells24, uint16_t &bits12_out) {
   uint16_t v = 0;
-  for (int i=0; i<24; i+=2) {
+  for (int i=0;i<24; i+=2) {
     uint8_t a = cells24[i];
     uint8_t b = cells24[i+1];
-    if (a!=b) return 1; // invalid symbol
+    if (a!=b) return 1;
     v = (uint16_t)((v << 1) | (a ? 1 : 0));
   }
   bits12_out = v;
@@ -252,25 +332,34 @@ uint8_t ComProtSlave::decode12_from_24cells(const volatile uint8_t *cells24, uin
 void ComProtSlave::handleDecoded(uint8_t mtype, uint8_t A6, uint8_t cmd4) {
   last_mtype = mtype; last_A6 = A6; last_cmd4 = cmd4;
 
-  // Presence (POLL_ID)
   if (mtype == POLL_ID && A6 == (slaveId & 0x3F)) {
-    expectReplyWindow = true;
-    mustReplyYes = true;
+    expectPresenceReply = true; // YES=00
     return;
   }
 
-  // Commands
   if (mtype == CMD_TO_TYPE && A6 == (slaveType & 0x3F)) {
     if (handlers[cmd4]) handlers[cmd4](cmd4, masterId);
   } else if (mtype == CMD_TO_ID && A6 == (slaveId & 0x3F)) {
-    if (handlers[cmd4]) handlers[cmd4](cmd4, masterId);
+    if (cmd4 == CMD_WHOAREYOU) {
+      // prepare TYPE reply: 6 bits -> 12 cells
+      uint8_t t = (slaveType & 0x3F);
+      for (int i=5, w=0; i>=0; --i) {
+        uint8_t b = (t >> i) & 1;
+        typeReplyCells[w++] = b;
+        typeReplyCells[w++] = b;
+      }
+      typeReplyLen = 12;
+      typeReplyIdx = 0;
+      expectTypeReply = true;
+    } else {
+      if (handlers[cmd4]) handlers[cmd4](cmd4, masterId);
+    }
   }
 }
 
 void IRAM_ATTR ComProtSlave::onClkRiseISR() {
   if (!self) return;
 
-  // sample DATA and update SYNC window (keep 15 bits)
   int d = data_read(self->DATA) ? 1 : 0;
   self->syncWindow = ((self->syncWindow << 1) | (d & 1)) & 0x7FFF;
 
@@ -296,7 +385,6 @@ void IRAM_ATTR ComProtSlave::onClkRiseISR() {
             self->rxState = RX_POST_GUARD;
             self->postCount = 0;
           } else {
-            // invalid symbol => resync
             self->rxState = RX_WAIT_SYNC;
           }
         }
@@ -304,29 +392,60 @@ void IRAM_ATTR ComProtSlave::onClkRiseISR() {
       break;
 
     case RX_POST_GUARD:
-      // 2 guard cells "11"
       self->postCount++;
       if (self->postCount >= 2) {
-        // begin reply window (2 cells)
-        if (self->expectReplyWindow && self->mustReplyYes) {
-          data_drive0(self->DATA); // YES="00" -> hold low for both cells
-        } else {
-          data_release(self->DATA); // NO="11"
-        }
-        self->rxState = RX_RESP_WINDOW;
+        // begin reply window
         self->postCount = 0;
+        if (self->expectTypeReply && self->typeReplyLen == 12) {
+          // drive first cell for TYPE reply
+          uint8_t c = self->typeReplyCells[self->typeReplyIdx++];
+          if (c==0) data_drive0(self->DATA); else data_release(self->DATA);
+          self->rxState = RX_RESP_WINDOW;
+        } else if (self->expectPresenceReply) {
+          // YES => two low cells
+          data_drive0(self->DATA);
+          self->rxState = RX_RESP_WINDOW;
+        } else {
+          data_release(self->DATA);
+          self->rxState = RX_RESP_WINDOW;
+        }
       }
       break;
 
     case RX_RESP_WINDOW:
-      self->postCount++;
-      if (self->postCount >= 2) {
-        // end of reply window
-        data_release(self->DATA);
-        self->expectReplyWindow = false;
-        self->mustReplyYes = false;
-        self->postCount = 0;
-        self->rxState = RX_WAIT_SYNC;
+      if (self->expectTypeReply && self->typeReplyLen == 12) {
+        // TYPE: stream remaining 11 cells
+        if (self->typeReplyIdx < self->typeReplyLen) {
+          uint8_t c = self->typeReplyCells[self->typeReplyIdx++];
+          if (c==0) data_drive0(self->DATA); else data_release(self->DATA);
+        } else {
+          // done
+          data_release(self->DATA);
+          self->expectTypeReply = false;
+          self->typeReplyLen = 0;
+          self->typeReplyIdx = 0;
+          self->rxState = RX_WAIT_SYNC;
+        }
+      } else if (self->expectPresenceReply) {
+        // PRESENCE2: already holding low for first cell; on second cell keep or end
+        self->postCount++;
+        if (self->postCount >= 1) {
+          // second cell
+          data_drive0(self->DATA); // still low
+          // finish after 2 cells total
+          data_release(self->DATA);
+          self->expectPresenceReply = false;
+          self->postCount = 0;
+          self->rxState = RX_WAIT_SYNC;
+        }
+      } else {
+        // NO reply (release for both cells)
+        self->postCount++;
+        if (self->postCount >= 2) {
+          data_release(self->DATA);
+          self->postCount = 0;
+          self->rxState = RX_WAIT_SYNC;
+        }
       }
       break;
   }
