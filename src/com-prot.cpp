@@ -1,388 +1,297 @@
 #include "com-prot.h"
+#include <Ticker.h>
+using namespace StarWire;
 
-// Static instance pointers for callbacks
-ComProtMaster* ComProtMaster::instance = nullptr;
-ComProtSlave* ComProtSlave::instance = nullptr;
+// --------------------- Master ---------------------
+static Ticker _starwire_ticker_master; // single instance guard
+ComProtMaster* ComProtMaster::self = nullptr;
 
-// ============================================================================
-// ComProtBase Implementation
-// ============================================================================
-
-ComProtBase::ComProtBase(uint8_t pin) : pin(pin), bus(nullptr), debugHandler(nullptr), 
-    lastReceiveTime(0), totalReceiveCalls(0), sumIntervals(0), maxInterval(0) {
-}
-
-ComProtBase::~ComProtBase() {
-    if (bus) {
-        delete bus;
-        bus = nullptr;
-    }
-}
-
-void ComProtBase::initializeBus(uint8_t deviceId) {
-    bus = new PJON<SoftwareBitBang>(deviceId);
-}
-
-void ComProtBase::begin() {
-    if (bus) {
-        bus->strategy.set_pin(pin);
-        bus->set_acknowledge(false);
-        bus->set_crc_32(true);
-        bus->set_packet_auto_deletion(true);
-        bus->begin();
-    }
-}
-
-void ComProtBase::receive(unsigned long time) {
-    unsigned long currentTime = micros();
-    
-    // Track timing for statistics
-    if (lastReceiveTime > 0) {
-        unsigned long interval = currentTime - lastReceiveTime;
-        sumIntervals += interval;
-        totalReceiveCalls++;
-        
-        if (interval > maxInterval) {
-            maxInterval = interval;
-        }
-    }
-    lastReceiveTime = currentTime;
-    
-    // Call PJON receive with or without time parameter
-    if (time > 0) bus->receive(time);
-    else          bus->receive();
-    bus->update(); // Ensure bus is updated after receiving
-    
-}
-
-void ComProtBase::calculateAndPrintStats() {
-    if (totalReceiveCalls == 0) {
-        return;
-    }
-    
-    // Calculate average
-    unsigned long average = sumIntervals / totalReceiveCalls;
-    
-    // Print statistics
-    Serial.print("Receive Stats - Count: ");
-    Serial.print(totalReceiveCalls);
-    Serial.print(", Avg: ");
-    Serial.print(average);
-    Serial.print("μs, Max: ");
-    Serial.print(maxInterval);
-    Serial.println("μs");
-    
-    // Reset statistics for next interval
-    totalReceiveCalls = 0;
-    sumIntervals = 0;
-    maxInterval = 0;
-}
-
-void ComProtBase::setDebugReceiveHandler(DebugReceiveHandler handler) {
-    debugHandler = handler;
-}
-
-void ComProtBase::removeDebugReceiveHandler() {
-    debugHandler = nullptr;
-}
-
-// ============================================================================
-// ComProtMaster Implementation
-// ============================================================================
-
-ComProtMaster::ComProtMaster(uint8_t masterId, uint8_t pin, unsigned long heartbeatTimeout) 
-    : ComProtBase(pin), masterId(masterId), heartbeatTimeout(heartbeatTimeout) {
-    initializeBus(masterId);
-    slaves.reserve(20); // Reserve space for performance
-    instance = this;
+ComProtMaster::ComProtMaster(uint8_t _masterId, uint8_t dataPin, uint8_t clkPin,
+                             unsigned long heartbeatTimeoutMs, uint16_t cell_us)
+: ComProtBase({clkPin, dataPin}, cell_us),
+  masterId(_masterId),
+  heartbeatTimeout(heartbeatTimeoutMs),
+  DATA(dataPin), CLK(clkPin)
+{
+  slaves.reserve(MAX_SLAVES_HINT);
 }
 
 ComProtMaster::~ComProtMaster() {
-    instance = nullptr;
+  stopTicker();
+  if (self == this) self = nullptr;
 }
 
 void ComProtMaster::begin() {
-    ComProtBase::begin(); // Call base class begin
-    if (bus) {
-        bus->set_receiver(staticReceiver);
-    }
+  pinMode(CLK, OUTPUT);
+  digitalWrite(CLK, LOW);
+  data_release(DATA); // idle HIGH via pull-up
+  self = this;
+  startTicker();
 }
 
+void ComProtMaster::startTicker() {
+  if (ticking) return;
+  ticking = true;
+  _starwire_ticker_master.attach_us(cellUs, onTickISR);
+}
+
+void ComProtMaster::stopTicker() {
+  if (!ticking) return;
+  _starwire_ticker_master.detach();
+  ticking = false;
+}
+
+// Build: SYNC(15) + payload(24 cells) + GUARD(2x '1') ; resp read handled in ISR
+void ComProtMaster::buildFrameAndKick(uint8_t mtype, uint8_t A6, uint8_t cmd4) {
+  uint16_t bits12 = pack12(mtype, A6, cmd4);
+  uint8_t payload[24];
+  encode12_to_24cells(bits12, payload);
+
+  uint16_t i=0;
+  for (uint8_t k=0;k<SYNC_LEN;++k) txCells[i++] = SYNC_PATTERN[k];
+  for (uint8_t k=0;k<24;++k)       txCells[i++] = payload[k];
+  // GUARD (idle 2 cells)
+  txCells[i++] = 1;
+  txCells[i++] = 1;
+
+  txLen = i;
+  cellIdx = 0;
+  respSampleIdx = 0;
+  inRespWindow = false;
+}
+
+// Non-blocking: schedule one POLL per update + do timeouts
 void ComProtMaster::update() {
-    bus->update();
-    
-    // Receive with short timeout
-    receive(); // 100 microseconds timeout
-    
-    // Check for slave timeouts periodically (every 500ms)
-    static unsigned long lastTimeoutCheck = 0;
-    unsigned long currentTime = millis();
-    if (currentTime - lastTimeoutCheck > 500) {
-        checkSlaveTimeouts();
-        lastTimeoutCheck = currentTime;
-    }
+  // Schedule next poll if nothing currently streaming (guarded by checking cellIdx>=txLen and not in resp)
+  static bool pendingKick = false;
+  static uint8_t pending_mtype=0, pending_A6=0, pending_cmd4=0;
+  if (!inRespWindow && (cellIdx >= txLen)) {
+    // Prefer queued commands? (simple round-robin: scan IDs)
+    pending_mtype = POLL_ID;
+    pending_A6 = scanNextId;
+    pending_cmd4 = 0;
+
+    buildFrameAndKick(pending_mtype, pending_A6, pending_cmd4);
+
+    // advance for next time
+    scanNextId = (scanNextId + 1) & 0x3F;
+  }
+
+  checkTimeouts();
 }
 
-void ComProtMaster::staticReceiver(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (instance) {
-        instance->handleMessage(payload, length, packet_info);
+// ISR: one cell per tick
+void IRAM_ATTR ComProtMaster::onTickISR() {
+  if (!self) return;
+  // Toggle clock rising edge: we keep clock HIGH during cell center, LOW otherwise (simple)
+  static bool clk = false;
+  clk = !clk;
+  digitalWrite(self->CLK, clk ? HIGH : LOW);
+
+  if (!clk) return; // operate on rising edge only
+
+  if (self->cellIdx < self->txLen) {
+    // send this cell
+    uint8_t b = self->txCells[self->cellIdx++];
+    if (b) { data_release(self->DATA); } else { data_drive0(self->DATA); }
+    if (self->cellIdx >= self->txLen) {
+      // finished payload+guard -> release line for response
+      data_release(self->DATA);
+      self->inRespWindow = true;
+      self->respSampleIdx = 0;
     }
+  } else if (self->inRespWindow) {
+    // read two cells response
+    if (self->respSampleIdx < 2) {
+      self->respSample[self->respSampleIdx++] = data_read(self->DATA) ? 1 : 0;
+      if (self->respSampleIdx >= 2) {
+        self->inRespWindow = false;
+        // decode presence: YES="00" => present
+        bool present = (self->respSample[0]==0 && self->respSample[1]==0);
+        // We know what we just polled: it's the last scheduled POLL_ID
+        // Simplify: last polled id is (cellIdx==txLen) and we used scanNextId-1
+        uint8_t polledId = (self->scanNextId + 63) & 0x3F;
+        self->handlePresenceResult(polledId, present);
+      }
+    }
+  }
 }
 
-void ComProtMaster::handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (length < 1) return;
-    
-    uint8_t messageType = payload[0];
-    
-    // Call debug handler if set
-    if (debugHandler) {
-        debugHandler(payload, length, packet_info.tx.id, messageType);
+void ComProtMaster::handlePresenceResult(uint8_t polledId, bool present) {
+  if (present) {
+    auto it = findSlave(polledId);
+    if (it == slaves.end()) {
+      // Type unknown yet; we will learn it on first command or provide a separate "who are you" command if needed.
+      slaves.push_back({polledId, 0xFF, millis()});
+    } else {
+      it->lastSeenMs = millis();
     }
-    
-    switch (messageType) {
-        case COM_PROT_HEARTBEAT:
-            if (length >= 3) { // messageType + id + type
-                uint8_t slaveType = payload[2];
-                
-                // Use the actual sender ID from packet info
-                addOrUpdateSlave(packet_info.tx.id, slaveType);
-            }
-            break;
-            
-        default:
-            // Handle other message types if needed
-            break;
-    }
+  } else {
+    // do nothing; timeout will remove
+  }
 }
 
 std::vector<SlaveInfo>::iterator ComProtMaster::findSlave(uint8_t id) {
-    for (auto it = slaves.begin(); it != slaves.end(); ++it) {
-        if (it->id == id) {
-            return it;
-        }
-    }
-    return slaves.end();
+  for (auto it = slaves.begin(); it != slaves.end(); ++it) if (it->id == id) return it;
+  return slaves.end();
 }
 
-void ComProtMaster::addOrUpdateSlave(uint8_t id, uint8_t type) {
-    auto it = findSlave(id);
-    
-    if (it != slaves.end()) {
-        // Update existing slave
-        it->lastHeartbeat = millis();
-        it->type = type;
-    } else {
-        // Add new slave
-        slaves.emplace_back(id, type);
-    }
+void ComProtMaster::checkTimeouts() {
+  unsigned long now = millis();
+  for (auto it = slaves.begin(); it != slaves.end();) {
+    if (now - it->lastSeenMs > heartbeatTimeout) it = slaves.erase(it);
+    else ++it;
+  }
 }
 
-void ComProtMaster::checkSlaveTimeouts() {
-    unsigned long currentTime = millis();
-    
-    for (auto it = slaves.begin(); it != slaves.end();) {
-        if (currentTime - it->lastHeartbeat > heartbeatTimeout) {
-            it = slaves.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-std::vector<SlaveInfo> ComProtMaster::getConnectedSlaves() {
-    return slaves;
-}
+std::vector<SlaveInfo> ComProtMaster::getConnectedSlaves() { return slaves; }
 
 std::vector<SlaveInfo> ComProtMaster::getSlavesByType(uint8_t type) {
-    std::vector<SlaveInfo> result;
-    for (const auto& slave : slaves) {
-        if (slave.type == type) {
-            result.push_back(slave);
-        }
-    }
-    return result;
+  std::vector<SlaveInfo> r; for (auto &s: slaves) if (s.type==type) r.push_back(s); return r;
 }
 
-bool ComProtMaster::isSlaveConnected(uint8_t id) {
-    return findSlave(id) != slaves.end();
+bool ComProtMaster::isSlaveConnected(uint8_t id) { return findSlave(id) != slaves.end(); }
+
+bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t cmd) {
+  // Fire-and-forget broadcast by type (no response window use)
+  buildFrameAndKick(CMD_TO_TYPE, slaveType & 0x3F, cmd & 0x0F);
+  return true;
 }
-bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command,
-                                           uint8_t* data, uint16_t dataLen) {
-  // small stack buffer to avoid heap fragmentation
-  uint8_t msg[32];
-  uint16_t len = 3 + dataLen;
-  if (len > sizeof(msg)) return false;
 
-  msg[0] = COM_PROT_COMMAND;
-  msg[1] = slaveType;     // target type for broadcast
-  msg[2] = command;
-  if (data && dataLen) memcpy(&msg[3], data, dataLen);
+bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t cmd) {
+  buildFrameAndKick(CMD_TO_ID, slaveId & 0x3F, cmd & 0x0F);
+  return true;
+}
 
-  // Try to send with retry
-  uint16_t pid = bus->send(PJON_BROADCAST, msg, len);
-  if (pid == PJON_FAIL) {
-    // buffer full; caller can retry later
-    return false;
+// --------------------- Slave ---------------------
+ComProtSlave* ComProtSlave::self = nullptr;
+
+ComProtSlave::ComProtSlave(uint8_t _slaveId, uint8_t _slaveType, uint8_t dataPin, uint8_t clkPin,
+                           uint8_t _masterId, unsigned long /*hb*/, uint16_t cell_us)
+: ComProtBase({clkPin, dataPin}, cell_us),
+  slaveId(_slaveId), slaveType(_slaveType), masterId(_masterId),
+  DATA(dataPin), CLK(clkPin)
+{
+  for (auto &h : handlers) h = nullptr;
+}
+
+ComProtSlave::~ComProtSlave() {
+  if (self == this) self = nullptr;
+  detachInterrupt(digitalPinToInterrupt(CLK));
+}
+
+void ComProtSlave::begin() {
+  pinMode(DATA, INPUT); // release
+  pinMode(CLK, INPUT);
+  self = this;
+  attachInterrupt(digitalPinToInterrupt(CLK), onClkRiseISR, RISING);
+}
+
+void ComProtSlave::update() {
+  // nothing periodic (reply is driven inside ISR only in the 2-cell window)
+}
+
+void ComProtSlave::setCommandHandler(uint8_t cmdType, CommandHandler h) {
+  if (cmdType < 16) handlers[cmdType] = h;
+}
+
+void ComProtSlave::removeCommandHandler(uint8_t cmdType) {
+  if (cmdType < 16) handlers[cmdType] = nullptr;
+}
+
+bool ComProtSlave::matchSYNC(uint16_t w) {
+  // compare last 15 bits of w with SYNC_PATTERN
+  for (int i=0;i<15;++i) {
+    uint8_t bit = (w >> (14 - i)) & 1;
+    if (bit != SYNC_PATTERN[i]) return false;
   }
   return true;
 }
 
-
-bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command,
-                                         uint8_t* data, uint16_t dataLen) {
-  uint8_t msg[32];
-  uint16_t len = 3 + dataLen;
-  if (len > sizeof(msg)) return false;
-
-  msg[0] = COM_PROT_COMMAND;
-  msg[1] = 0;             // 0 ⇒ unicast
-  msg[2] = command;
-  if (data && dataLen) memcpy(&msg[3], data, dataLen);
-
-  uint16_t pid = bus->send(slaveId, msg, len);
-  return pid != PJON_FAIL;
+uint8_t ComProtSlave::decode12_from_24cells(const uint8_t *cells24, uint16_t &bits12_out) {
+  uint16_t v = 0;
+  for (int i=0, j=0; i<24; i+=2, ++j) {
+    uint8_t a = cells24[i];
+    uint8_t b = cells24[i+1];
+    if (a!=b) return 1; // invalid symbol
+    v = (uint16_t)((v << 1) | (a ? 1 : 0));
+  }
+  bits12_out = v;
+  return 0;
 }
 
-void ComProtMaster::setHeartbeatTimeout(unsigned long timeout) {
-    heartbeatTimeout = timeout;
+void ComProtSlave::handleDecoded(uint8_t mtype, uint8_t A6, uint8_t cmd4) {
+  last_mtype = mtype; last_A6 = A6; last_cmd4 = cmd4;
+
+  // Presence reply on POLL_ID match
+  if (mtype == POLL_ID && A6 == (slaveId & 0x3F)) {
+    expectReplyWindow = true;
+    mustReplyYes = true;
+    return;
+  }
+
+  if (mtype == CMD_TO_TYPE && A6 == (slaveType & 0x3F)) {
+    if (handlers[cmd4]) handlers[cmd4](cmd4, masterId);
+  } else if (mtype == CMD_TO_ID && A6 == (slaveId & 0x3F)) {
+    if (handlers[cmd4]) handlers[cmd4](cmd4, masterId);
+  }
 }
 
-uint8_t ComProtMaster::getMasterId() const {
-    return masterId;
-}
+void IRAM_ATTR ComProtSlave::onClkRiseISR() {
+  if (!self) return;
 
-size_t ComProtMaster::getSlaveCount() const {
-    return slaves.size();
-}
+  // sample DATA
+  int d = data_read(self->DATA) ? 1 : 0;
 
-// ============================================================================
-// ComProtSlave Implementation
-// ============================================================================
+  // shift into a 15-bit window
+  self->syncWindow = ((self->syncWindow << 1) | (d & 1)) & 0x7FFF;
 
-ComProtSlave::ComProtSlave(uint8_t slaveId, uint8_t slaveType, uint8_t pin, uint8_t masterId, unsigned long heartbeatInterval)
-    : ComProtBase(pin), slaveId(slaveId), slaveType(slaveType), masterId(masterId), heartbeatInterval(heartbeatInterval), lastHeartbeat(0) {
-    initializeBus(slaveId);
-    instance = this;
-}
-
-ComProtSlave::~ComProtSlave() {
-    instance = nullptr;
-}
-
-void ComProtSlave::begin() {
-    ComProtBase::begin(); // Call base class begin
-    if (bus) {
-        bus->set_receiver(staticReceiver);
+  if (!self->collecting) {
+    // look for SYNC
+    if (matchSYNC(self->syncWindow)) {
+      self->collecting = 1;
+      self->recvIdx = 0;
     }
-}
+    return;
+  }
 
-void ComProtSlave::update() {
-    bus->update();
-    
-    // Receive with short timeout to avoid blocking
-    receive(); // 100 microseconds timeout
-    
-    // Send heartbeat if interval has passed
-    unsigned long currentTime = millis();
-    if (currentTime - lastHeartbeat > heartbeatInterval) {
-        sendHeartbeat();
-        lastHeartbeat = currentTime;
+  // collecting payload 24 cells
+  if (self->recvIdx < 24) {
+    self->recvCells[self->recvIdx++] = (uint8_t)d;
+    if (self->recvIdx >= 24) {
+      // decode 12 bits
+      uint16_t bits12 = 0;
+      if (!decode12_from_24cells(self->recvCells, bits12)) {
+        uint8_t mtype = (bits12 >> 10) & 0x03;
+        uint8_t A6    = (bits12 >>  4) & 0x3F;
+        uint8_t cmd4  =  bits12        & 0x0F;
+        self->handleDecoded(mtype, A6, cmd4);
+        if (self->collecting) self->collecting = 0;
+      } else {
+        self->collecting = 0; // invalid -> resync
+      }
     }
-}
+    return;
+  }
 
-void ComProtSlave::staticReceiver(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (instance) {
-        instance->handleMessage(payload, length, packet_info);
+  // After payload there is a 2-cell guard "11" then a 2-cell reply window.
+  // We simply count two more rising edges (guard), then if expectReplyWindow drive reply for next 2 cells.
+  static uint8_t postCount = 0;
+  postCount++;
+  if (postCount == 2) {
+    // start of reply window
+    if (self->expectReplyWindow && self->mustReplyYes) {
+      // YES = "00": pull low for next 2 cells
+      data_drive0(self->DATA);
+    } else {
+      // NO = "11": do nothing (release)
+      data_release(self->DATA);
     }
-}
-
-void ComProtSlave::handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (length < 1) return;
-    
-    uint8_t messageType = payload[0];
-    
-    // Call debug handler if set
-    if (debugHandler) {
-        debugHandler(payload, length, packet_info.tx.id, messageType);
-    }
-    
-    if (messageType == COM_PROT_COMMAND && length >= 3) {
-        uint8_t targetType = payload[1];  // 0 for unicast, specific type for broadcast
-        uint8_t command = payload[2];
-        
-        // Check if this message is for us:
-        // - If targetType is 0, it's a unicast message (sent directly to us)
-        // - If targetType matches our slaveType, it's a broadcast for our type
-        if (targetType == 0 || targetType == slaveType) {
-            // Find and execute command handler
-            for (const auto& handler : commandHandlers) {
-                if (handler.first == command) {
-                    // Extract data portion (everything after messageType, targetType, and command)
-                    uint8_t* data = (length > 3) ? &payload[3] : nullptr;
-                    uint16_t dataLen = (length > 3) ? length - 3 : 0;
-                    
-                    handler.second(data, dataLen, packet_info.tx.id);
-                    break;
-                }
-            }
-        }
-    }
-}
-
-void ComProtSlave::sendHeartbeat() {
-    uint8_t heartbeat[3] = {COM_PROT_HEARTBEAT, slaveId, slaveType};
-    bus->send(masterId, heartbeat, sizeof(heartbeat));
-}
-
-void ComProtSlave::setHeartbeatInterval(unsigned long interval) {
-    heartbeatInterval = interval;
-}
-
-void ComProtSlave::setCommandHandler(uint8_t commandType, CommandHandler handler) {
-    // Remove existing handler for this command type
-    removeCommandHandler(commandType);
-    
-    // Add new handler
-    commandHandlers.emplace_back(commandType, handler);
-}
-
-void ComProtSlave::removeCommandHandler(uint8_t commandType) {
-    commandHandlers.erase(
-        std::remove_if(commandHandlers.begin(), commandHandlers.end(),
-            [commandType](const std::pair<uint8_t, CommandHandler>& handler) {
-                return handler.first == commandType;
-            }),
-        commandHandlers.end()
-    );
-}
-
-bool ComProtSlave::sendResponse(uint8_t commandType, uint8_t* data, uint16_t dataLen) {
-    // Prepare response message: messageType + command + data
-    uint8_t messageLen = 2 + dataLen;
-    uint8_t* message = new uint8_t[messageLen];
-    
-    message[0] = COM_PROT_COMMAND;
-    message[1] = commandType;
-    
-    if (data && dataLen > 0) {
-        memcpy(&message[2], data, dataLen);
-    }
-    
-    bus->send(masterId, message, messageLen);
-    
-    delete[] message;
-    
-    return true; // Always return true since ACK is disabled
-}
-
-uint8_t ComProtSlave::getSlaveId() const {
-    return slaveId;
-}
-
-uint8_t ComProtSlave::getSlaveType() const {
-    return slaveType;
-}
-
-uint8_t ComProtSlave::getMasterId() const {
-    return masterId;
+  } else if (postCount == 4) {
+    // end of reply window
+    data_release(self->DATA);
+    self->expectReplyWindow = false;
+    self->mustReplyYes = false;
+    postCount = 0;
+  }
 }
