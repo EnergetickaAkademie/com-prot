@@ -214,7 +214,7 @@ private:
   // helpers
   static bool matchSYNC(uint16_t w);
   void handleDecoded(uint8_t mtype, uint8_t A6, uint8_t cmd4);
-  static uint8_t decode12_from_24cells(const uint8_t *cells24, uint16_t &bits12_out);
+static uint8_t decode12_from_24cells(const volatile uint8_t *cells24, uint16_t &bits12_out);
 };
 
 } // namespace StarWire

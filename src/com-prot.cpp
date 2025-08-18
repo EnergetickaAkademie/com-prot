@@ -1,7 +1,14 @@
 #include "com-prot.h"
-#include <Ticker.h>
-using namespace StarWire;
 
+extern "C" {
+  #include "ets_sys.h"
+  #include "os_type.h"
+  #include "osapi.h"
+  #include "user_interface.h"
+}
+
+using namespace StarWire;
+static inline uint32_t _cell_ticks(uint16_t cellUs) { return (uint32_t)cellUs * 5u; }
 // --------------------- Master ---------------------
 static Ticker _starwire_ticker_master; // single instance guard
 ComProtMaster* ComProtMaster::self = nullptr;
@@ -32,14 +39,20 @@ void ComProtMaster::begin() {
 void ComProtMaster::startTicker() {
   if (ticking) return;
   ticking = true;
-  _starwire_ticker_master.attach_us(cellUs, onTickISR);
+
+  timer1_isr_init();
+  timer1_attachInterrupt(onTickISR);
+  // TIM_DIV16 => 0.2us per tick, edge, loop
+  timer1_enable(TIM_DIV16, TIM_EDGE, TIM_LOOP);
+  timer1_write(_cell_ticks(cellUs)); // interrupt každých cellUs
 }
 
 void ComProtMaster::stopTicker() {
   if (!ticking) return;
-  _starwire_ticker_master.detach();
+  timer1_disable();
   ticking = false;
 }
+
 
 // Build: SYNC(15) + payload(24 cells) + GUARD(2x '1') ; resp read handled in ISR
 void ComProtMaster::buildFrameAndKick(uint8_t mtype, uint8_t A6, uint8_t cmd4) {
@@ -63,7 +76,6 @@ void ComProtMaster::buildFrameAndKick(uint8_t mtype, uint8_t A6, uint8_t cmd4) {
 // Non-blocking: schedule one POLL per update + do timeouts
 void ComProtMaster::update() {
   // Schedule next poll if nothing currently streaming (guarded by checking cellIdx>=txLen and not in resp)
-  static bool pendingKick = false;
   static uint8_t pending_mtype=0, pending_A6=0, pending_cmd4=0;
   if (!inRespWindow && (cellIdx >= txLen)) {
     // Prefer queued commands? (simple round-robin: scan IDs)
@@ -208,7 +220,7 @@ bool ComProtSlave::matchSYNC(uint16_t w) {
   return true;
 }
 
-uint8_t ComProtSlave::decode12_from_24cells(const uint8_t *cells24, uint16_t &bits12_out) {
+uint8_t ComProtSlave::decode12_from_24cells(const volatile uint8_t *cells24, uint16_t &bits12_out) {
   uint16_t v = 0;
   for (int i=0, j=0; i<24; i+=2, ++j) {
     uint8_t a = cells24[i];
@@ -219,6 +231,7 @@ uint8_t ComProtSlave::decode12_from_24cells(const uint8_t *cells24, uint16_t &bi
   bits12_out = v;
   return 0;
 }
+
 
 void ComProtSlave::handleDecoded(uint8_t mtype, uint8_t A6, uint8_t cmd4) {
   last_mtype = mtype; last_A6 = A6; last_cmd4 = cmd4;
@@ -262,7 +275,7 @@ void IRAM_ATTR ComProtSlave::onClkRiseISR() {
       // decode 12 bits
       uint16_t bits12 = 0;
       if (!decode12_from_24cells(self->recvCells, bits12)) {
-        uint8_t mtype = (bits12 >> 10) & 0x03;
+          uint8_t mtype = (bits12 >> 10) & 0x03;
         uint8_t A6    = (bits12 >>  4) & 0x3F;
         uint8_t cmd4  =  bits12        & 0x0F;
         self->handleDecoded(mtype, A6, cmd4);
