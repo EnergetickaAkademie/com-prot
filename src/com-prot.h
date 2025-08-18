@@ -5,7 +5,7 @@
 
 /*
   StarWire (CLK+DATA) protocol for ESP8266
-  - DATA open-drain: 1=release (INPUT), 0=drive low (OUTPUT LOW)
+  - DATA open-drain: 1=release (INPUT / open-drain HIGH), 0=drive low (OUTPUT LOW)
   - Bit symbol (payload): logical 0 -> "00", logical 1 -> "11" (cells)
   - SYNC (cells): "000111000111000" (15 cells, odd-length runs; cannot occur in data)
   - Frame: MTYPE(2) + A(6) + CMD(4)  => 12 logical bits => 24 cells
@@ -53,7 +53,7 @@ inline uint16_t pack12(uint8_t mtype2, uint8_t A6, uint8_t cmd4) {
          ((uint16_t)(cmd4 & 0x0F));
 }
 
-// ---------- Open-drain helpers ----------
+// ---------- Open-drain helpers (non-ISR use OK) ----------
 inline void data_release(uint8_t pin) { pinMode(pin, INPUT); }
 inline void data_drive0(uint8_t pin)  { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }
 inline int  data_read(uint8_t pin)    { return digitalRead(pin); }
@@ -227,6 +227,10 @@ private:
   // decoded last (debug)
   volatile uint8_t last_mtype = 0, last_A6 = 0, last_cmd4 = 0;
 
+  // pending user command (mimo ISR)
+  volatile bool     pendingCmdValid = false;
+  volatile uint8_t  pendingCmd4 = 0;
+
   // command handlers
   CommandHandler handlers[16];
 
@@ -238,9 +242,8 @@ private:
   static void IRAM_ATTR onClkRiseISR();
 
   // helpers
-  static bool matchSYNC(uint16_t w);
   void handleDecoded(uint8_t mtype, uint8_t A6, uint8_t cmd4);
-  static uint8_t decode12_from_24cells(const volatile uint8_t *cells24, uint16_t &bits12_out);
+  static uint8_t IRAM_ATTR decode12_from_24cells(const volatile uint8_t *cells24, uint16_t &bits12_out);
 };
 
 } // namespace StarWire
