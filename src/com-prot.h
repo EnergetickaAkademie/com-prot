@@ -95,7 +95,7 @@ public:
 class ComProtMaster : public ComProtBase {
 public:
   explicit ComProtMaster(uint8_t masterId, uint8_t dataPin, uint8_t clkPin,
-                         unsigned long heartbeatTimeoutMs = 3100,
+                         unsigned long heartbeatTimeoutMs = 1000,
                          uint16_t cell_us = CELL_US_DEFAULT);
   ~ComProtMaster();
 
