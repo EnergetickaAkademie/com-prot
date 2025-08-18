@@ -4,7 +4,7 @@ A PJON-based communication protocol library for ESP8266 master-slave networks us
 
 ## Features
 
-- **UART Communication**: Uses PJON's ThroughSerialAsync strategy for reliable communication at 9600 baud
+- **UART Communication**: Uses PJON's ThroughSerial strategy for reliable communication at 9600 baud
 - **Master-Slave Architecture**: Simple and reliable communication pattern
 - **Type-based Broadcasting**: Send commands to all slaves of a specific type using PJON broadcast
 - **Individual Addressing**: Send commands to specific slaves by ID
@@ -231,7 +231,7 @@ Master (ID: 1)     Slave 1 (ID: 10)    Slave 2 (ID: 11)
 - **Parity**: None  
 - **Stop Bits**: 1
 - **Flow Control**: None
-- **Strategy**: PJON ThroughSerialAsync
+- **Strategy**: PJON ThroughSerial
 - **Acknowledgments**: Disabled for better performance
 - **CRC**: 32-bit CRC enabled for data integrity
 

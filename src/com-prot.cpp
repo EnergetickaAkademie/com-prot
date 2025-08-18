@@ -4,67 +4,155 @@
 ComProtMaster* ComProtMaster::instance = nullptr;
 ComProtSlave* ComProtSlave::instance = nullptr;
 
+// Protocol framing
+// 0xAA 0x55 LEN BODY...
+// BODY: SRC DST TYPE PAYLOAD... CRC16(2 bytes, big-endian)
+static constexpr uint8_t PRE1 = 0xAA;
+static constexpr uint8_t PRE2 = 0x55;
+
 // ============================================================================
-// ComProtBase Implementation
+// ComProtBase Implementation (UART, CRC, parser)
 // ============================================================================
 
-ComProtBase::ComProtBase() : bus(nullptr), debugHandler(nullptr), 
-    lastReceiveTime(0), totalReceiveCalls(0), sumIntervals(0), maxInterval(0) {
-}
+ComProtBase::ComProtBase() : debugHandler(nullptr),
+    lastReceiveTime(0), totalReceiveCalls(0), sumIntervals(0), maxInterval(0) {}
 
-ComProtBase::~ComProtBase() {
-    if (bus) {
-        delete bus;
-        bus = nullptr;
-    }
-}
-
-void ComProtBase::initializeBus(uint8_t deviceId) {
-    bus = new PJON<ThroughSerialAsync>(deviceId);
-}
+ComProtBase::~ComProtBase() {}
 
 void ComProtBase::begin() {
-    if (bus) {
-        Serial.begin(9600);  // Initialize UART at 9600 baud
-        bus->strategy.set_serial(&Serial);
-        bus->set_acknowledge(false);
-        bus->set_crc_32(true);
-        bus->set_packet_auto_deletion(true);
-        bus->begin();
+    Serial.begin(COMPROT_BAUD);
+    randomSeed(micros());
+}
+
+// CRC16-CCITT (0x1021, init 0xFFFF, no xorout)
+uint16_t ComProtBase::crc16_ccitt(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (uint8_t b = 0; b < 8; ++b) {
+            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+            else crc <<= 1;
+        }
     }
+    return crc;
+}
+
+size_t ComProtBase::buildFrame(uint8_t* out, uint8_t dstId, uint8_t srcId, uint8_t msgType,
+                      const uint8_t* payload, uint8_t payloadLen) const {
+    // BODY = SRC DST TYPE PAY ... CRC_H CRC_L
+    uint8_t bodyLen = 3 + payloadLen + 2;
+    uint8_t idx = 0;
+    out[idx++] = PRE1;
+    out[idx++] = PRE2;
+    out[idx++] = bodyLen;
+    out[idx++] = srcId;
+    out[idx++] = dstId;
+    out[idx++] = msgType;
+    for (uint8_t i = 0; i < payloadLen; ++i) out[idx++] = payload[i];
+    // compute CRC over SRC..payload
+    uint16_t crc = crc16_ccitt(&out[3], 3 + payloadLen);
+    out[idx++] = (crc >> 8) & 0xFF;
+    out[idx++] = crc & 0xFF;
+    return idx;
+}
+
+void ComProtBase::writeRaw(const uint8_t* data, size_t len) const {
+    Serial.write(data, len);
+    Serial.flush();
 }
 
 void ComProtBase::receive(unsigned long time) {
-    unsigned long currentTime = micros();
-    
-    // Track timing for statistics
-    if (lastReceiveTime > 0) {
-        unsigned long interval = currentTime - lastReceiveTime;
-        sumIntervals += interval;
-        totalReceiveCalls++;
-        
-        if (interval > maxInterval) {
-            maxInterval = interval;
+    unsigned long start = micros();
+    do {
+        // stats timing
+        unsigned long now = micros();
+        if (lastReceiveTime > 0) {
+            unsigned long dt = now - lastReceiveTime;
+            sumIntervals += dt;
+            totalReceiveCalls++;
+            if (dt > maxInterval) maxInterval = dt;
         }
+        lastReceiveTime = now;
+
+        while (Serial.available()) {
+            uint8_t byteIn = (uint8_t)Serial.read();
+            switch (rxState) {
+                case WAIT_PREAMBLE1:
+                    if (byteIn == PRE1) rxState = WAIT_PREAMBLE2;
+                    break;
+                case WAIT_PREAMBLE2:
+                    if (byteIn == PRE2) rxState = READ_LEN; else rxState = WAIT_PREAMBLE1;
+                    break;
+                case READ_LEN:
+                    rxLen = byteIn;
+                    if (rxLen == 0 || rxLen > MAX_FRAME_SIZE) { rxState = WAIT_PREAMBLE1; break; }
+                    rxIndex = 0;
+                    rxState = READ_BODY;
+                    break;
+                case READ_BODY:
+                    rxBuf[rxIndex++] = byteIn;
+                    if (rxIndex >= rxLen) {
+                        // verify CRC
+                        if (rxLen < 5) { // minimum SRC DST TYPE CRC(2)
+                            rxState = WAIT_PREAMBLE1;
+                            break;
+                        }
+                        uint16_t recvCrc = ((uint16_t)rxBuf[rxLen-2] << 8) | rxBuf[rxLen-1];
+                        uint16_t calcCrc = crc16_ccitt(rxBuf, rxLen-2);
+                        if (recvCrc == calcCrc) {
+                            dispatchFrame(rxBuf, rxLen);
+                        } else {
+                            onCrcError();
+                        }
+                        rxState = WAIT_PREAMBLE1;
+                    }
+                    break;
+            }
+        }
+
+    // 5s stats print (optional)
+#if COMPROT_ENABLE_STATS
+    static unsigned long lastPrint = 0;
+    unsigned long nowMs = millis();
+    if (nowMs - lastPrint >= 5000) {
+        calculateAndPrintStats();
+        lastPrint = nowMs;
     }
-    lastReceiveTime = currentTime;
-    
-    // Call PJON receive with or without time parameter
-    if (time > 0) bus->receive(time);
-    else          bus->receive();
-    bus->update(); // Ensure bus is updated after receiving
-    
+#endif
+    } while (time > 0 && (micros() - start) < time);
+}
+
+void ComProtBase::dispatchFrame(const uint8_t* body, uint8_t bodyLen) {
+    if (bodyLen < 5) return;
+    uint8_t src = body[0];
+    uint8_t dst = body[1];
+    uint8_t type = body[2];
+    const uint8_t* payload = &body[3];
+    uint16_t payloadLen = bodyLen - 5; // exclude SRC,DST,TYPE and CRC(2)
+
+    if (debugHandler) {
+        debugHandler((uint8_t*)payload, payloadLen, src, type);
+    }
+
+    // deliver only if for us or broadcast (dst 0)
+    if (dst == 0 || dst == getSelfId()) {
+        handleMessage(type, (uint8_t*)payload, payloadLen, src, dst);
+    }
+}
+
+void ComProtBase::sendFrame(uint8_t dstId, uint8_t msgType, const uint8_t* payload, uint8_t payloadLen) {
+    uint8_t frame[140];
+    uint8_t src = getSelfId();
+    uint8_t bodyTmp[128];
+    // Build in a single buffer using helper, which writes preamble too
+    size_t len = buildFrame(frame, dstId, src, msgType, payload, payloadLen);
+    writeRaw(frame, len);
 }
 
 void ComProtBase::calculateAndPrintStats() {
-    if (totalReceiveCalls == 0) {
-        return;
-    }
-    
-    // Calculate average
+#if COMPROT_ENABLE_STATS
+    if (totalReceiveCalls == 0) return;
     unsigned long average = sumIntervals / totalReceiveCalls;
-    
-    // Print statistics
     Serial.print("Receive Stats - Count: ");
     Serial.print(totalReceiveCalls);
     Serial.print(", Avg: ");
@@ -72,267 +160,175 @@ void ComProtBase::calculateAndPrintStats() {
     Serial.print("μs, Max: ");
     Serial.print(maxInterval);
     Serial.println("μs");
-    
-    // Reset statistics for next interval
     totalReceiveCalls = 0;
     sumIntervals = 0;
     maxInterval = 0;
+#endif
 }
 
-void ComProtBase::setDebugReceiveHandler(DebugReceiveHandler handler) {
-    debugHandler = handler;
-}
-
-void ComProtBase::removeDebugReceiveHandler() {
-    debugHandler = nullptr;
-}
+void ComProtBase::setDebugReceiveHandler(DebugReceiveHandler handler) { debugHandler = handler; }
+void ComProtBase::removeDebugReceiveHandler() { debugHandler = nullptr; }
 
 // ============================================================================
-// ComProtMaster Implementation
+// ComProtMaster Implementation (UART protocol)
 // ============================================================================
 
-ComProtMaster::ComProtMaster(uint8_t masterId, unsigned long heartbeatTimeout) 
+ComProtMaster::ComProtMaster(uint8_t masterId, unsigned long heartbeatTimeout)
     : ComProtBase(), masterId(masterId), heartbeatTimeout(heartbeatTimeout) {
-    initializeBus(masterId);
-    slaves.reserve(20); // Reserve space for performance
+    slaves.reserve(20);
     instance = this;
 }
 
-ComProtMaster::~ComProtMaster() {
-    instance = nullptr;
-}
+ComProtMaster::~ComProtMaster() { instance = nullptr; }
 
-void ComProtMaster::begin() {
-    ComProtBase::begin(); // Call base class begin
-    if (bus) {
-        bus->set_receiver(staticReceiver);
-    }
-}
+void ComProtMaster::begin() { ComProtBase::begin(); }
 
 void ComProtMaster::update() {
-    bus->update();
-    
-    // Receive with short timeout
-    receive(); // 100 microseconds timeout
-    
-    // Check for slave timeouts periodically (every 500ms)
+    // Poll UART quickly
+    receive(1000); // 1ms window
+    // Check timeouts each 500ms
     static unsigned long lastTimeoutCheck = 0;
-    unsigned long currentTime = millis();
-    if (currentTime - lastTimeoutCheck > 500) {
-        checkSlaveTimeouts();
-        lastTimeoutCheck = currentTime;
-    }
+    unsigned long now = millis();
+    if (now - lastTimeoutCheck > 500) { checkSlaveTimeouts(); lastTimeoutCheck = now; }
 }
 
-void ComProtMaster::staticReceiver(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (instance) {
-        instance->handleMessage(payload, length, packet_info);
-    }
+void ComProtMaster::onCrcError() {
+    // broadcast retry signal so slaves random-backoff and retry
+    sendFrame(0, COM_PROT_RETRY, nullptr, 0);
 }
 
-void ComProtMaster::handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (length < 1) return;
-    
-    uint8_t messageType = payload[0];
-    
-    // Call debug handler if set
-    if (debugHandler) {
-        debugHandler(payload, length, packet_info.tx.id, messageType);
-    }
-    
+void ComProtMaster::handleMessage(uint8_t messageType, uint8_t* payload, uint16_t length,
+                                  uint8_t srcId, uint8_t dstId) {
     switch (messageType) {
         case COM_PROT_HEARTBEAT:
-            if (length >= 3) { // messageType + id + type
-                uint8_t slaveType = payload[2];
-                
-                // Use the actual sender ID from packet info
-                addOrUpdateSlave(packet_info.tx.id, slaveType);
+            if (length >= 1) {
+                uint8_t slaveType = payload[0];
+                addOrUpdateSlave(srcId, slaveType);
             }
             break;
-            
+        case COM_PROT_COMMAND:
+            // master could process responses here if needed
+            break;
         default:
-            // Handle other message types if needed
             break;
     }
 }
 
 std::vector<SlaveInfo>::iterator ComProtMaster::findSlave(uint8_t id) {
-    for (auto it = slaves.begin(); it != slaves.end(); ++it) {
-        if (it->id == id) {
-            return it;
-        }
-    }
+    for (auto it = slaves.begin(); it != slaves.end(); ++it) if (it->id == id) return it;
     return slaves.end();
 }
 
 void ComProtMaster::addOrUpdateSlave(uint8_t id, uint8_t type) {
     auto it = findSlave(id);
-    
-    if (it != slaves.end()) {
-        // Update existing slave
-        it->lastHeartbeat = millis();
-        it->type = type;
-    } else {
-        // Add new slave
-        slaves.emplace_back(id, type);
-    }
+    if (it != slaves.end()) { it->lastHeartbeat = millis(); it->type = type; }
+    else { slaves.emplace_back(id, type); }
 }
 
 void ComProtMaster::checkSlaveTimeouts() {
-    unsigned long currentTime = millis();
-    
+    unsigned long now = millis();
     for (auto it = slaves.begin(); it != slaves.end();) {
-        if (currentTime - it->lastHeartbeat > heartbeatTimeout) {
-            it = slaves.erase(it);
-        } else {
-            ++it;
-        }
+        if (now - it->lastHeartbeat > heartbeatTimeout) it = slaves.erase(it);
+        else ++it;
     }
 }
 
-std::vector<SlaveInfo> ComProtMaster::getConnectedSlaves() {
-    return slaves;
-}
+std::vector<SlaveInfo> ComProtMaster::getConnectedSlaves() { return slaves; }
 
 std::vector<SlaveInfo> ComProtMaster::getSlavesByType(uint8_t type) {
-    std::vector<SlaveInfo> result;
-    for (const auto& slave : slaves) {
-        if (slave.type == type) {
-            result.push_back(slave);
-        }
-    }
-    return result;
+    std::vector<SlaveInfo> res; for (const auto& s : slaves) if (s.type == type) res.push_back(s); return res;
 }
 
-bool ComProtMaster::isSlaveConnected(uint8_t id) {
-    return findSlave(id) != slaves.end();
-}
+bool ComProtMaster::isSlaveConnected(uint8_t id) { return findSlave(id) != slaves.end(); }
+
 bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command,
                                            uint8_t* data, uint16_t dataLen) {
-  // small stack buffer to avoid heap fragmentation
-  uint8_t msg[32];
-  uint16_t len = 3 + dataLen;
-  if (len > sizeof(msg)) return false;
-
-  msg[0] = COM_PROT_COMMAND;
-  msg[1] = slaveType;     // target type for broadcast
-  msg[2] = command;
-  if (data && dataLen) memcpy(&msg[3], data, dataLen);
-
-  // Try to send with retry
-  uint16_t pid = bus->send(PJON_BROADCAST, msg, len);
-  if (pid == PJON_FAIL) {
-    // buffer full; caller can retry later
-    return false;
-  }
-  return true;
+    // Broadcast command to type; payload = [type, command, data...]
+    uint8_t buf[64];
+    if (dataLen + 2 > sizeof(buf)) return false;
+    buf[0] = slaveType;
+    buf[1] = command;
+    if (data && dataLen) memcpy(&buf[2], data, dataLen);
+    sendFrame(0 /*broadcast*/, COM_PROT_COMMAND, buf, (uint8_t)(dataLen + 2));
+    return true;
 }
-
 
 bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command,
                                          uint8_t* data, uint16_t dataLen) {
-  uint8_t msg[32];
-  uint16_t len = 3 + dataLen;
-  if (len > sizeof(msg)) return false;
-
-  msg[0] = COM_PROT_COMMAND;
-  msg[1] = 0;             // 0 ⇒ unicast
-  msg[2] = command;
-  if (data && dataLen) memcpy(&msg[3], data, dataLen);
-
-  uint16_t pid = bus->send(slaveId, msg, len);
-  return pid != PJON_FAIL;
+    uint8_t buf[64];
+    if (dataLen + 1 > sizeof(buf)) return false;
+    buf[0] = command;
+    if (data && dataLen) memcpy(&buf[1], data, dataLen);
+    sendFrame(slaveId, COM_PROT_COMMAND, buf, (uint8_t)(dataLen + 1));
+    return true;
 }
 
-void ComProtMaster::setHeartbeatTimeout(unsigned long timeout) {
-    heartbeatTimeout = timeout;
-}
-
-uint8_t ComProtMaster::getMasterId() const {
-    return masterId;
-}
-
-size_t ComProtMaster::getSlaveCount() const {
-    return slaves.size();
-}
+void ComProtMaster::setHeartbeatTimeout(unsigned long timeout) { heartbeatTimeout = timeout; }
+uint8_t ComProtMaster::getMasterId() const { return masterId; }
+size_t ComProtMaster::getSlaveCount() const { return slaves.size(); }
 
 // ============================================================================
 // ComProtSlave Implementation
 // ============================================================================
 
 ComProtSlave::ComProtSlave(uint8_t slaveId, uint8_t slaveType, uint8_t masterId, unsigned long heartbeatInterval)
-    : ComProtBase(), slaveId(slaveId), slaveType(slaveType), masterId(masterId), heartbeatInterval(heartbeatInterval), lastHeartbeat(0) {
-    initializeBus(slaveId);
-    instance = this;
-}
+    : ComProtBase(), slaveId(slaveId), slaveType(slaveType), masterId(masterId), heartbeatInterval(heartbeatInterval), lastHeartbeat(0) { instance = this; }
 
 ComProtSlave::~ComProtSlave() {
     instance = nullptr;
 }
 
-void ComProtSlave::begin() {
-    ComProtBase::begin(); // Call base class begin
-    if (bus) {
-        bus->set_receiver(staticReceiver);
-    }
-}
+void ComProtSlave::begin() { ComProtBase::begin(); }
 
 void ComProtSlave::update() {
-    bus->update();
-    
-    // Receive with short timeout to avoid blocking
-    receive(); // 100 microseconds timeout
-    
-    // Send heartbeat if interval has passed
-    unsigned long currentTime = millis();
-    if (currentTime - lastHeartbeat > heartbeatInterval) {
-        sendHeartbeat();
-        lastHeartbeat = currentTime;
+    // Poll UART non-blocking window
+    receive(1000);
+    // If a resend is scheduled due to retry, send after time passed
+    if (resendScheduled && micros() >= resendAtMicros) {
+        writeRaw(lastFrame, lastFrameLen);
+        resendScheduled = false;
+        lastFrameLen = 0;
     }
+    // Heartbeat
+    unsigned long now = millis();
+    if (now - lastHeartbeat > heartbeatInterval) { sendHeartbeat(); lastHeartbeat = now; }
 }
 
-void ComProtSlave::staticReceiver(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (instance) {
-        instance->handleMessage(payload, length, packet_info);
+void ComProtSlave::handleMessage(uint8_t messageType, uint8_t* payload, uint16_t length,
+                                 uint8_t srcId, uint8_t dstId) {
+    if (messageType == COM_PROT_RETRY) {
+        // schedule resend with random backoff 0..10ms
+        if (lastFrameLen > 0 && !resendScheduled) {
+            uint16_t backoff = (uint16_t)random(0, 10000); // microseconds
+            resendAtMicros = micros() + backoff;
+            resendScheduled = true;
+        }
+        return;
     }
-}
-
-void ComProtSlave::handleMessage(uint8_t *payload, uint16_t length, const PJON_Packet_Info &packet_info) {
-    if (length < 1) return;
-    
-    uint8_t messageType = payload[0];
-    
-    // Call debug handler if set
-    if (debugHandler) {
-        debugHandler(payload, length, packet_info.tx.id, messageType);
-    }
-    
-    if (messageType == COM_PROT_COMMAND && length >= 3) {
-        uint8_t targetType = payload[1];  // 0 for unicast, specific type for broadcast
-        uint8_t command = payload[2];
-        
-        // Check if this message is for us:
-        // - If targetType is 0, it's a unicast message (sent directly to us)
-        // - If targetType matches our slaveType, it's a broadcast for our type
-        if (targetType == 0 || targetType == slaveType) {
-            // Find and execute command handler
-            for (const auto& handler : commandHandlers) {
-                if (handler.first == command) {
-                    // Extract data portion (everything after messageType, targetType, and command)
-                    uint8_t* data = (length > 3) ? &payload[3] : nullptr;
-                    uint16_t dataLen = (length > 3) ? length - 3 : 0;
-                    
-                    handler.second(data, dataLen, packet_info.tx.id);
-                    break;
-                }
-            }
+    if (messageType == COM_PROT_COMMAND) {
+        if (length == 0) return;
+        // Unicast: payload[0]=command, rest=data
+        // Broadcast-to-type: payload[0]=type, payload[1]=command, rest=data
+        if (dstId == slaveId) {
+            uint8_t cmd = payload[0];
+            uint8_t* data = (length > 1) ? &payload[1] : nullptr;
+            uint16_t dataLen = (length > 1) ? length - 1 : 0;
+            for (const auto& h : commandHandlers) if (h.first == cmd) { h.second(data, dataLen, srcId); break; }
+        } else if (dstId == 0 && length >= 2 && payload[0] == slaveType) {
+            uint8_t cmd = payload[1];
+            uint8_t* data = (length > 2) ? &payload[2] : nullptr;
+            uint16_t dataLen = (length > 2) ? length - 2 : 0;
+            for (const auto& h : commandHandlers) if (h.first == cmd) { h.second(data, dataLen, srcId); break; }
         }
     }
 }
 
 void ComProtSlave::sendHeartbeat() {
-    uint8_t heartbeat[3] = {COM_PROT_HEARTBEAT, slaveId, slaveType};
-    bus->send(masterId, heartbeat, sizeof(heartbeat));
+    uint8_t hb[1] = { slaveType };
+    uint8_t frame[140];
+    size_t flen = buildFrame(frame, masterId, slaveId, COM_PROT_HEARTBEAT, hb, 1);
+    writeRaw(frame, flen);
+    if (flen <= MAX_RAW_FRAME) { memcpy(lastFrame, frame, flen); lastFrameLen = flen; }
 }
 
 void ComProtSlave::setHeartbeatInterval(unsigned long interval) {
@@ -358,22 +354,18 @@ void ComProtSlave::removeCommandHandler(uint8_t commandType) {
 }
 
 bool ComProtSlave::sendResponse(uint8_t commandType, uint8_t* data, uint16_t dataLen) {
-    // Prepare response message: messageType + command + data
-    uint8_t messageLen = 2 + dataLen;
-    uint8_t* message = new uint8_t[messageLen];
-    
-    message[0] = COM_PROT_COMMAND;
-    message[1] = commandType;
-    
-    if (data && dataLen > 0) {
-        memcpy(&message[2], data, dataLen);
-    }
-    
-    bus->send(masterId, message, messageLen);
-    
-    delete[] message;
-    
-    return true; // Always return true since ACK is disabled
+    // Build payload: [commandType, data...]
+    uint8_t buf[64];
+    if (dataLen + 1 > sizeof(buf)) return false;
+    buf[0] = commandType;
+    if (data && dataLen) memcpy(&buf[1], data, dataLen);
+    // Build full frame to allow retry resend
+    uint8_t frame[140];
+    size_t flen = buildFrame(frame, masterId, slaveId, COM_PROT_COMMAND, buf, (uint8_t)(dataLen + 1));
+    writeRaw(frame, flen);
+    // keep copy for possible retry
+    if (flen <= MAX_RAW_FRAME) { memcpy(lastFrame, frame, flen); lastFrameLen = flen; }
+    return true;
 }
 
 uint8_t ComProtSlave::getSlaveId() const {

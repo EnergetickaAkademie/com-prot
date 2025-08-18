@@ -1,8 +1,8 @@
 /*
- * Slave Example using Com-Prot Library with UART ThroughSerialAsync
+ * Slave Example using Com-Prot Library with UART ThroughSerial
  * 
  * This example shows how to use the Com-Prot library with PJON's
- * ThroughSerialAsync strategy for reliable UART communication at 9600 baud.
+ * ThroughSerial strategy for reliable UART communication at 9600 baud.
  */
 
 #include <Arduino.h>
@@ -146,10 +146,10 @@ void setup() {
     slave.begin();
     
     Serial1.printf("Com-Prot Slave initialized - ID: %d, Type: %d\n", SLAVE_ID, SLAVE_TYPE);
-    Serial1.println("UART ThroughSerialAsync initialized at 9600 baud");
+    Serial1.println("UART ThroughSerial initialized at 9600 baud");
     
     WebSerial.printf("Slave ID: %d, Type: %d\n", SLAVE_ID, SLAVE_TYPE);
-    WebSerial.println("UART ThroughSerialAsync at 9600 baud");
+    WebSerial.println("UART ThroughSerial at 9600 baud");
     WebSerial.println("Command handlers registered:");
     WebSerial.println("  0x10 - LED Control");
     WebSerial.println("  0x20 - Temperature Request");

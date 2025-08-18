@@ -2,16 +2,16 @@
 
 ## Overview
 
-The com-prot library has been updated to use PJON's ThroughSerialAsync strategy instead of SoftwareBitBang for more reliable UART communication at 9600 baud.
+The com-prot library has been updated to use PJON's ThroughSerial strategy instead of SoftwareBitBang for more reliable UART communication at 9600 baud.
 
 ## Key Changes
 
 ### 1. Library Changes (com-prot)
 
 #### Header File (com-prot.h)
-- Changed from `#define PJON_INCLUDE_SWBB` to `#define PJON_INCLUDE_TSA`
-- Changed from `#include <PJONSoftwareBitBang.h>` to `#include <PJONThroughSerialAsync.h>`
-- Updated `PJON<SoftwareBitBang>` to `PJON<ThroughSerialAsync>`
+- Changed from `#define PJON_INCLUDE_SWBB` to `#define PJON_INCLUDE_TS`
+- Changed from `#include <PJONSoftwareBitBang.h>` to `#include <PJON.h>`
+- Updated `PJON<SoftwareBitBang>` to `PJON<ThroughSerial>`
 - Removed pin parameter from constructors
 - Updated constructor signatures:
   - `ComProtMaster(uint8_t masterId, unsigned long heartbeatTimeout = 3100)`
@@ -51,7 +51,7 @@ Both master and slave examples updated to:
 - Single wire bus on specified pin (e.g., D1)
 - Common ground
 
-### New Setup (UART ThroughSerialAsync)
+### New Setup (UART ThroughSerial)
 - UART TX/RX bus configuration
 - All TX lines connected together
 - All RX lines connected together  
@@ -63,7 +63,7 @@ Both master and slave examples updated to:
 - **Baud Rate**: 9600 (automatically configured)
 - **UART**: Uses hardware Serial (UART0) 
 - **Debug Output**: Must use Serial1 (TX-only on GPIO2)
-- **Strategy**: PJON ThroughSerialAsync
+- **Strategy**: PJON ThroughSerial
 - **Acknowledgments**: Disabled for better performance
 - **CRC**: 32-bit CRC enabled
 
