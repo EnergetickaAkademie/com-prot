@@ -127,6 +127,7 @@ private:
   uint8_t scanNextId = 0;
   volatile uint8_t currentlyPollingId = 0xFF;
   volatile uint8_t pendingWhoId = 0xFF; // schedule WHOAREYOU for this id
+  volatile uint8_t whoTargetId = 0xFF;  // ID pro právě běžící WHOAREYOU/TYPE12
 
   // ISR state
   static ComProtMaster* self;
@@ -212,8 +213,9 @@ private:
   volatile uint8_t  recvCells[24];
   volatile uint8_t  recvIdx = 0;
 
-  // post phase counters
-  volatile uint8_t  postCount = 0;
+  // counters
+  volatile uint8_t  postCount = 0;     // counts guard cells
+  volatile uint8_t  replyCount = 0;    // counts reply cells
 
   // reply modes
   volatile bool     expectPresenceReply = false; // 2 cells "00"
