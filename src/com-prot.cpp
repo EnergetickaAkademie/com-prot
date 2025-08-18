@@ -10,7 +10,6 @@ extern "C" {
 using namespace StarWire;
 static inline uint32_t _cell_ticks(uint16_t cellUs) { return (uint32_t)cellUs * 5u; }
 // --------------------- Master ---------------------
-static Ticker _starwire_ticker_master; // single instance guard
 ComProtMaster* ComProtMaster::self = nullptr;
 
 ComProtMaster::ComProtMaster(uint8_t _masterId, uint8_t dataPin, uint8_t clkPin,
