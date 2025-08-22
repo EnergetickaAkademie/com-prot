@@ -83,15 +83,15 @@ void ComProtMaster::stopTicker() {
   ticking = false;
 }
 
-// Build: SYNC(15) + payload(24) + GUARD("11"); choose response mode
+// Build: SYNC(15) + payload+CRC(32) + GUARD("11"); choose response mode
 void ComProtMaster::buildFrameAndKick(uint8_t mtype, uint8_t A6, uint8_t cmd4, RespMode rm) {
-  uint16_t bits12 = pack12(mtype, A6, cmd4);
-  uint8_t payload[24];
-  encode12_to_24cells(bits12, payload);
+  uint16_t bits16 = pack16_with_crc(mtype, A6, cmd4);
+  uint8_t payload[32];
+  encode16_to_32cells(bits16, payload);
 
   uint16_t i=0;
   for (uint8_t k=0;k<SYNC_LEN;++k) txCells[i++] = SYNC_PATTERN[k];
-  for (uint8_t k=0;k<24;++k)       txCells[i++] = payload[k];
+  for (uint8_t k=0;k<32;++k)       txCells[i++] = payload[k];
   txCells[i++] = 1; txCells[i++] = 1; // GUARD
 
   txLen = i;
@@ -196,16 +196,20 @@ void IRAM_ATTR ComProtMaster::onTickISR() {
             self->presenceEvtPending = true;
           }
         } else if (self->respMode == RESP_TYPE12) {
-          // decode 6 bits from dibits
+          // decode 6 bits from dibits. Treat a response that never pulls the
+          // line LOW ("111111" -> type 63) as invalid to avoid false positives
+          // when no slave replies.
           uint8_t t = 0;
           bool ok = true;
+          bool sawZero = false;
           for (int i=0;i<12;i+=2) {
             uint8_t a = self->respCells[i];
             uint8_t b = self->respCells[i+1];
             if (a!=b) { ok=false; break; }
+            if (a==0) sawZero = true;
             t = (uint8_t)((t<<1) | (a?1:0));
           }
-          if (ok && self->whoTargetId != 0xFF) {
+          if (ok && sawZero && self->whoTargetId != 0xFF) {
             self->typeEvtId  = self->whoTargetId;
             self->typeEvtVal = (t & 0x3F);
             self->typeEvtPending = true;
@@ -342,15 +346,18 @@ void ComProtSlave::removeCommandHandler(uint8_t cmdType) {
   if (cmdType < 16) handlers[cmdType] = nullptr;
 }
 
-uint8_t IRAM_ATTR ComProtSlave::decode12_from_24cells(const volatile uint8_t *cells24, uint16_t &bits12_out) {
+uint8_t IRAM_ATTR ComProtSlave::decode16_from_32cells(const volatile uint8_t *cells32, uint16_t &bits16_out) {
   uint16_t v = 0;
-  for (int i=0;i<24; i+=2) {
-    uint8_t a = cells24[i];
-    uint8_t b = cells24[i+1];
+  for (int i=0;i<32; i+=2) {
+    uint8_t a = cells32[i];
+    uint8_t b = cells32[i+1];
     if (a!=b) return 1;
     v = (uint16_t)((v << 1) | (a ? 1 : 0));
   }
-  bits12_out = v;
+  uint16_t data12 = (v >> 4);
+  uint8_t  crc    = (uint8_t)(v & 0x0F);
+  if (crc4(data12) != crc) return 2;
+  bits16_out = v;
   return 0;
 }
 
@@ -406,11 +413,12 @@ void IRAM_ATTR ComProtSlave::onClkRiseISR() {
       break;
 
     case RX_PAYLOAD:
-      if (self->recvIdx < 24) {
+      if (self->recvIdx < 32) {
         self->recvCells[self->recvIdx++] = (uint8_t)d;
-        if (self->recvIdx >= 24) {
-          uint16_t bits12 = 0;
-          if (!decode12_from_24cells(self->recvCells, bits12)) {
+        if (self->recvIdx >= 32) {
+          uint16_t bits16 = 0;
+          if (!decode16_from_32cells(self->recvCells, bits16)) {
+            uint16_t bits12 = (bits16 >> 4);
             uint8_t mtype = (bits12 >> 10) & 0x03;
             uint8_t A6    = (bits12 >>  4) & 0x3F;
             uint8_t cmd4  =  bits12        & 0x0F;
