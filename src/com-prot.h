@@ -22,7 +22,7 @@ struct Pins {
   uint8_t data;  // open-drain
 };
 
-static const uint16_t CELL_US_DEFAULT = 80;    // 25 kHz cell clock
+static const uint16_t CELL_US_DEFAULT = 160;    // 25 kHz cell clock
 static const uint8_t  MAX_SLAVES_HINT = 20;
 
 // ---------- Encoding helpers ----------
