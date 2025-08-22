@@ -1,231 +1,81 @@
-# Com-Prot Library
+# Com-Prot (StarWire) Library
 
-A PJON-based communication protocol library for ESP8266 master-slave networks.
+A tiny two–wire communication protocol for ESP8266 style devices.  The master
+drives a **clock** line while all devices share a single **open‑drain data**
+line.  Slaves speak only when explicitly addressed by the master.
 
-## Features
+## Protocol overview
 
-- **Master-Slave Architecture**: Simple and reliable communication pattern
-- **Type-based Broadcasting**: Send commands to all slaves of a specific type using PJON broadcast
-- **Individual Addressing**: Send commands to specific slaves by ID
-- **Automatic Slave Discovery**: Masters automatically detect connecting/disconnecting slaves
-- **Flexible Command Handling**: Slaves can register custom handlers for different command types
-- **Debug Receive Handler**: Optional debug handler called on every received message
-- **Heartbeat System**: Automatic connection monitoring and timeout detection
-- **Built on PJON**: Leverages robust PJON library for reliable communication
+* **Encoding** – every logical bit is transmitted as two identical
+  "cells": `0 → 00`, `1 → 11`.
+* **Sync** – frames begin with the 15‑cell sequence
+  `000111000111000`.  Because encoded data never contains an odd run of
+  bits, this pattern cannot appear in payload and clearly marks the start of a
+  message.
+* **Payload format** – after SYNC the master sends 16 logical bits
+  (32 cells) packed as `MTYPE(2) | A(6) | CMD(4) | CRC(4)` followed by two guard
+  cells "11".
+  * `MTYPE` values: `0` = `POLL_ID`, `1` = `CMD_TO_TYPE`, `2` = `CMD_TO_ID`.
+  * `A` is either the slave ID or type depending on `MTYPE`.
+  * `CMD` is a 4‑bit command.  `CMD=0` in `CMD_TO_ID` means **WHOAREYOU**.
+  * `CRC` is a 4‑bit checksum of the preceding 12 bits (polynomial `x⁴+x+1`)
+    used to detect corrupted frames.
+* **Response windows** – after the guard cells the master releases the data
+  line and optionally samples a reply:
+  * After `POLL_ID` the addressed slave may answer with two cells: `00`
+    means *present*, `11` means *no device*.
+  * After `WHOAREYOU` the slave returns its 6‑bit type encoded as six dibits
+    (12 cells).
+
+## Timing & throughput
+
+The default cell period is **1 ms** (1 kHz clock).  A command frame consists of
+15 sync cells, 32 payload cells, and 2 guard cells – 49 cells total – so one
+frame takes 49 ms.  That yields roughly **20 frames per second** carrying
+16 payload bits each, for a raw throughput of about **320 bit/s** (~40 B/s).
+Presence (2‑cell) or type (12‑cell) response windows slightly reduce this rate.
+
+The odd‑length SYNC sequence and dibit encoding allow slaves to resynchronise
+after resets without false triggers, while the 4‑bit CRC guards against
+corrupted payloads.
+
+## Getting started
+
+```
+#include <com-prot.h>
+
+// Master on pins D2 (DATA) and D1 (CLK)
+StarWire::ComProtMaster master(1, D2, D1);
+
+void setup() {
+  Serial.begin(115200);
+  master.begin();
+}
+
+void loop() {
+  master.update();       // polls for presence and handles responses
+  // ... send commands with master.sendCommandToSlaveId(...) etc.
+}
+```
+
+For a complete example see `examples/`.
 
 ## Installation
 
 ### PlatformIO
 
-Add to your `platformio.ini`:
-
 ```ini
-lib_deps = 
+lib_deps =
     https://github.com/EnergetickaAkademie/com-prot.git
 ```
 
 ### Arduino IDE
 
-1. Download this repository as ZIP
-2. In Arduino IDE: Sketch → Include Library → Add .ZIP Library
-3. Select the downloaded ZIP file
-
-## Basic Usage
-
-### Master Example
-
-```cpp
-#include <com-prot.h>
-
-ComProtMaster master(1, D1); // Master ID 1, pin D1
-
-// Debug handler - called for every received message
-void debugHandler(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType) {
-    Serial.printf("[DEBUG] RX from %d: type=0x%02X, len=%d\n", senderId, messageType, length);
-}
-
-void setup() {
-    Serial.begin(115200);
-    
-    // Set debug receive handler (optional)
-    master.setDebugReceiveHandler(debugHandler);
-    
-    master.begin();
-}
-
-void loop() {
-    master.update();
-    
-    // Send command 0x10 to all slaves of type 2 (uses PJON broadcast)
-    master.sendCommandToSlaveType(2, 0x10);
-    
-    // Send command 0x20 to specific slave ID 5 (unicast)
-    master.sendCommandToSlaveId(5, 0x20);
-    
-    // Get all connected slaves
-    auto slaves = master.getConnectedSlaves();
-    Serial.printf("Connected slaves: %d\n", slaves.size());
-    
-    delay(1000);
-}
-```
-
-### Slave Example
-
-```cpp
-#include <com-prot.h>
-
-ComProtSlave slave(10, 2, D1); // Slave ID 10, Type 2, pin D1
-
-void handleLedCommand(uint8_t* data, uint16_t length, uint8_t senderId) {
-    if (length > 0) {
-        bool ledState = data[0];
-        digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
-        Serial.printf("LED turned %s by master %d\n", ledState ? "ON" : "OFF", senderId);
-    }
-}
-
-void handleTemperatureRequest(uint8_t* data, uint16_t length, uint8_t senderId) {
-    // Read temperature sensor
-    float temperature = 25.5; // Mock value
-    
-    // Send response back to master
-    uint8_t response[4];
-    memcpy(response, &temperature, sizeof(temperature));
-    slave.sendResponse(0x21, response, sizeof(response));
-}
-
-// Debug handler - called for every received message
-void debugHandler(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType) {
-    Serial.printf("[DEBUG] RX from %d: type=0x%02X, len=%d\n", senderId, messageType, length);
-}
-
-void setup() {
-    Serial.begin(115200);
-    
-    // Register command handlers
-    slave.setCommandHandler(0x10, handleLedCommand);
-    slave.setCommandHandler(0x20, handleTemperatureRequest);
-    
-    // Set debug receive handler (optional)
-    slave.setDebugReceiveHandler(debugHandler);
-    
-    slave.begin();
-    pinMode(LED_BUILTIN, OUTPUT);
-}
-
-void loop() {
-    slave.update();
-    delay(10);
-}
-```
-
-## API Reference
-
-### ComProtMaster
-
-#### Constructor
-```cpp
-ComProtMaster(uint8_t masterId, uint8_t pin, unsigned long heartbeatTimeout = 3100);
-```
-
-#### Methods
-
-- `void begin()` - Initialize the master
-- `void update()` - Call in loop() to handle communication
-- `bool sendCommandToSlaveType(uint8_t slaveType, uint8_t command, uint8_t* data = nullptr, uint16_t dataLen = 0)` - Send command to all slaves of specific type
-- `bool sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8_t* data = nullptr, uint16_t dataLen = 0)` - Send command to specific slave
-- `std::vector<SlaveInfo> getConnectedSlaves()` - Get all connected slaves
-- `std::vector<SlaveInfo> getSlavesByType(uint8_t type)` - Get slaves of specific type
-- `bool isSlaveConnected(uint8_t id)` - Check if slave is connected
-- `void setHeartbeatTimeout(unsigned long timeout)` - Set heartbeat timeout
-- `size_t getSlaveCount()` - Get number of connected slaves
-- `void setDebugReceiveHandler(DebugReceiveHandler handler)` - Set debug receive handler
-- `void removeDebugReceiveHandler()` - Remove debug receive handler
-
-### ComProtSlave
-
-#### Constructor
-```cpp
-ComProtSlave(uint8_t slaveId, uint8_t slaveType, uint8_t pin, uint8_t masterId = 1, unsigned long heartbeatInterval = 1000);
-```
-
-#### Methods
-
-- `void begin()` - Initialize the slave
-- `void update()` - Call in loop() to handle communication
-- `void setCommandHandler(uint8_t commandType, CommandHandler handler)` - Register command handler
-- `void removeCommandHandler(uint8_t commandType)` - Remove command handler
-- `bool sendResponse(uint8_t commandType, uint8_t* data = nullptr, uint16_t dataLen = 0)` - Send response to master
-- `void setHeartbeatInterval(unsigned long interval)` - Set heartbeat interval
-- `void setDebugReceiveHandler(DebugReceiveHandler handler)` - Set debug receive handler
-- `void removeDebugReceiveHandler()` - Remove debug receive handler
-
-#### Command Handler Function
-```cpp
-typedef std::function<void(uint8_t* payload, uint16_t length, uint8_t senderId)> CommandHandler;
-```
-
-#### Debug Receive Handler Function
-```cpp
-typedef std::function<void(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType)> DebugReceiveHandler;
-```
-
-## Hardware Setup
-
-Connect all devices to the same PJON bus:
-
-```
-Master (ID: 1)     Slave 1 (ID: 10)    Slave 2 (ID: 11)
-       |                  |                    |
-     Pin D1             Pin D1               Pin D1
-       |                  |                    |
-       +------------------+--------------------+  (PJON Bus)
-       |                  |                    |
-      GND                GND                  GND
-       |                  |                    |
-       +------------------+--------------------+  (Common Ground)
-```
-
-## Protocol Details
-
-### Message Types
-- `COM_PROT_HEARTBEAT` (0x03): Slave heartbeat messages
-- `COM_PROT_COMMAND` (0x04): Command messages
-
-### Message Format
-
-**Heartbeat**: `[0x03, slave_id, slave_type]`
-
-**Command to Type (Broadcast)**: `[0x04, slave_type, command, data...]`
-
-**Command to ID (Unicast)**: `[0x04, 0x00, command, data...]`
-
-### Debug Handler
-
-The debug receive handler is called for every received message, allowing you to:
-- Monitor all network traffic
-- Debug communication issues  
-- Log message statistics
-- Implement custom message filtering
-
-Example debug handler:
-```cpp
-void debugHandler(uint8_t* payload, uint16_t length, uint8_t senderId, uint8_t messageType) {
-    Serial.printf("[DEBUG] From %d: Type=0x%02X, Len=%d\n", senderId, messageType, length);
-    
-    // Print payload data
-    for (uint16_t i = 0; i < length && i < 8; i++) {
-        Serial.printf("0x%02X ", payload[i]);
-    }
-    Serial.println();
-}
-```
-
-## Integration with Existing Projects
-
-This library is designed to be a drop-in replacement for the existing PJON implementation in your OneWireHost and OneWireSlave projects. Simply replace the manual PJON handling with the library classes.
+1. Download this repository as ZIP.
+2. In Arduino IDE: **Sketch → Include Library → Add .ZIP Library**.
+3. Select the downloaded file.
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT
+
