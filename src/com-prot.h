@@ -23,7 +23,7 @@ struct Pins {
 };
 
 static const uint16_t CELL_US_DEFAULT = 160;    // 25 kHz cell clock
-static const uint8_t  MAX_SLAVES_HINT = 20;
+static const uint8_t  MAX_SLAVES_HINT = 7;
 
 // ---------- Encoding helpers ----------
 inline void encode12_to_24cells(uint16_t bits12, uint8_t *cells24) {
@@ -63,6 +63,7 @@ struct SlaveInfo {
   uint8_t id;
   uint8_t type;          // 0xFF = unknown
   unsigned long lastSeenMs;
+  uint8_t missedPolls;   // consecutive missed presence polls
 };
 
 using CommandHandler = std::function<void(uint8_t cmd4, const uint8_t senderId)>;
@@ -171,6 +172,7 @@ private:
   void schedulePollIfIdle();
   void scheduleWhoIfNeeded();
   void handlePresenceResult(uint8_t polledId, bool present);
+  void handlePresenceMiss(uint8_t polledId);
   void handleTypeResult(uint8_t id, uint8_t type);
   std::vector<SlaveInfo>::iterator findSlave(uint8_t id);
   void checkTimeouts();

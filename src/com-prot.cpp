@@ -142,9 +142,10 @@ void ComProtMaster::update() {
 
     if (yes) {
       handlePresenceResult(id, true);
-      // if type unknown, schedule WHO
       auto it = findSlave(id);
       if (it != slaves.end() && it->type == 0xFF) pendingWhoId = id;
+    } else {
+      handlePresenceMiss(id);
     }
   }
 
@@ -193,7 +194,7 @@ void IRAM_ATTR ComProtMaster::onTickISR() {
           if (self->currentlyPollingId != 0xFF) {
             self->presenceEvtId = self->currentlyPollingId;
             self->presenceEvtYes = present ? 1 : 0;
-            self->presenceEvtPending = true;
+            self->presenceEvtPending = true; // will handle miss if not present
           }
         } else if (self->respMode == RESP_TYPE12) {
           // decode 6 bits from dibits
@@ -225,9 +226,24 @@ void ComProtMaster::handlePresenceResult(uint8_t polledId, bool present) {
   if (present) {
     auto it = findSlave(polledId);
     if (it == slaves.end()) {
-      slaves.push_back({polledId, 0xFF, millis()});
+      slaves.push_back({polledId, 0xFF, millis(), 0});
     } else {
       it->lastSeenMs = millis();
+      it->missedPolls = 0; // reset consecutive misses on successful presence
+    }
+  } else {
+    // presence negative (should not be called with present=false currently)
+    handlePresenceMiss(polledId);
+  }
+}
+
+void ComProtMaster::handlePresenceMiss(uint8_t polledId) {
+  auto it = findSlave(polledId);
+  if (it != slaves.end()) {
+    if (it->missedPolls < 0xFF) it->missedPolls++;
+    if (it->missedPolls >= 15) {
+      // remove after 15 consecutive failed polls
+      slaves.erase(it);
     }
   }
 }
@@ -235,10 +251,11 @@ void ComProtMaster::handlePresenceResult(uint8_t polledId, bool present) {
 void ComProtMaster::handleTypeResult(uint8_t id, uint8_t type) {
   auto it = findSlave(id);
   if (it == slaves.end()) {
-    slaves.push_back({id, type & 0x3F, millis()});
+  slaves.push_back({id, type & 0x3F, millis(), 0});
   } else {
     it->type = (type & 0x3F);
     it->lastSeenMs = millis();
+  it->missedPolls = 0; // successful interaction
   }
 }
 
@@ -248,11 +265,7 @@ std::vector<SlaveInfo>::iterator ComProtMaster::findSlave(uint8_t id) {
 }
 
 void ComProtMaster::checkTimeouts() {
-  unsigned long now = millis();
-  for (auto it = slaves.begin(); it != slaves.end();) {
-    if (now - it->lastSeenMs > heartbeatTimeout) it = slaves.erase(it);
-    else ++it;
-  }
+  // no time-based removal; missedPolls logic handles removal
 }
 
 std::vector<SlaveInfo> ComProtMaster::getConnectedSlaves() { return slaves; }
