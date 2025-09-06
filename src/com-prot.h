@@ -62,7 +62,8 @@ inline int  data_read(uint8_t pin)    { return digitalRead(pin); }
 struct SlaveInfo {
   uint8_t id;
   uint8_t type;          // 0xFF = unknown
-  unsigned long lastSeenMs;
+  unsigned long lastSeenMs; // last confirmed presence (or last miss accounting update)
+  uint8_t missCount;        // consecutive heartbeatTimeout windows missed
 };
 
 using CommandHandler = std::function<void(uint8_t cmd4, const uint8_t senderId)>;
@@ -157,6 +158,7 @@ private:
 
   // list
   std::vector<SlaveInfo> slaves;
+  static const uint8_t MISS_THRESHOLD = 3; // require N consecutive misses before removal
 
   // pins
   uint8_t DATA, CLK;
