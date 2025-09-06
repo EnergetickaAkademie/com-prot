@@ -62,8 +62,9 @@ inline int  data_read(uint8_t pin)    { return digitalRead(pin); }
 struct SlaveInfo {
   uint8_t id;
   uint8_t type;          // 0xFF = unknown
-  unsigned long lastSeenMs; // last confirmed presence (or last miss accounting update)
+  unsigned long lastSeenMs; // last confirmed presence
   uint8_t missCount;        // consecutive heartbeatTimeout windows missed
+  unsigned long lastMissEvalMs; // last time we incremented missCount (to avoid rapid double increments)
 };
 
 using CommandHandler = std::function<void(uint8_t cmd4, const uint8_t senderId)>;

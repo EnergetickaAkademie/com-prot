@@ -139,9 +139,9 @@ void ComProtMaster::update() {
     bool    yes  = presenceEvtYes;
     presenceEvtPending = false;
     interrupts();
-
+    // Handle both YES and NO so miss counting works
+    handlePresenceResult(id, yes);
     if (yes) {
-      handlePresenceResult(id, true);
       // if type unknown, schedule WHO
       auto it = findSlave(id);
       if (it != slaves.end() && it->type == 0xFF) pendingWhoId = id;
@@ -225,22 +225,25 @@ void ComProtMaster::handlePresenceResult(uint8_t polledId, bool present) {
   if (present) {
     auto it = findSlave(polledId);
     if (it == slaves.end()) {
-      slaves.push_back({polledId, 0xFF, millis(), 0});
+      unsigned long now = millis();
+      slaves.push_back({polledId, 0xFF, now, 0, 0});
     } else {
       it->lastSeenMs = millis();
       it->missCount = 0; // reset consecutive miss counter on successful presence
+      it->lastMissEvalMs = 0; // allow future miss evaluation anew
     }
   } else {
     // We polled this ID but got NO response. Apply hysteresis: only increment once per polling cycle.
     auto it = findSlave(polledId);
     if (it != slaves.end()) {
-      // Only increment if enough time passed to consider a full heartbeat window.
-      // This prevents very rapid consecutive polls from inflating missCount prematurely.
       unsigned long now = millis();
+      // Evaluate miss only if at least heartbeatTimeout passed since lastSeenMs
+      // and we haven't already incremented for this window.
       if (now - it->lastSeenMs >= heartbeatTimeout) {
-        if (it->missCount < 0xFF) it->missCount++;
-        // Move lastSeenMs forward to avoid multiple increments within same timeout window
-        it->lastSeenMs = now; 
+        if (it->lastMissEvalMs == 0 || (now - it->lastMissEvalMs) >= heartbeatTimeout) {
+          if (it->missCount < 0xFF) it->missCount++;
+          it->lastMissEvalMs = now;
+        }
       }
     }
   }
@@ -249,11 +252,13 @@ void ComProtMaster::handlePresenceResult(uint8_t polledId, bool present) {
 void ComProtMaster::handleTypeResult(uint8_t id, uint8_t type) {
   auto it = findSlave(id);
   if (it == slaves.end()) {
-  slaves.push_back({id, type & 0x3F, millis(), 0});
+  unsigned long now = millis();
+  slaves.push_back({id, type & 0x3F, now, 0, 0});
   } else {
     it->type = (type & 0x3F);
     it->lastSeenMs = millis();
   it->missCount = 0;
+  it->lastMissEvalMs = 0;
   }
 }
 
@@ -266,7 +271,7 @@ void ComProtMaster::checkTimeouts() {
   unsigned long now = millis();
   for (auto it = slaves.begin(); it != slaves.end();) {
     // Removal condition: exceeded heartbeatTimeout and missCount threshold.
-    if (now - it->lastSeenMs > heartbeatTimeout && it->missCount >= MISS_THRESHOLD) {
+  if ((now - it->lastSeenMs) > (heartbeatTimeout * (unsigned long)MISS_THRESHOLD) && it->missCount >= MISS_THRESHOLD) {
       it = slaves.erase(it);
     } else {
       ++it;
