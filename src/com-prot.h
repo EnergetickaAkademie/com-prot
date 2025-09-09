@@ -22,7 +22,10 @@ struct Pins {
   uint8_t data;  // open-drain
 };
 
-static const uint16_t CELL_US_DEFAULT = 160;    // 25 kHz cell clock
+// Default cell period. Increase to slow the wire (helps margin on long buses).
+// 160 us ≈ 25 kHz. Using 480 us makes it ~3x slower (≈ 2.08 kHz per bit cell after dibit encoding
+// and framing). Both master and slaves use the same default unless overridden in ctor.
+static const uint16_t CELL_US_DEFAULT = 480;
 static const uint8_t  MAX_SLAVES_HINT = 20;
 
 // ---------- Encoding helpers ----------
@@ -170,6 +173,7 @@ private:
   static void IRAM_ATTR onTickISR();
 
   // helpers
+  void schedulePendingIfIdle();
   void buildFrameAndKick(uint8_t mtype, uint8_t A6, uint8_t cmd4, RespMode rm);
   void schedulePollIfIdle();
   void scheduleWhoIfNeeded();
@@ -177,6 +181,16 @@ private:
   void handleTypeResult(uint8_t id, uint8_t type);
   std::vector<SlaveInfo>::iterator findSlave(uint8_t id);
   void checkTimeouts();
+
+  // Non-queuing pending command buffers per address (newest wins per slot).
+  static const uint8_t ADDR_SPACE = 64; // 6-bit A field
+  volatile uint8_t  pendingTypeValid[ADDR_SPACE] = {0};
+  volatile uint8_t  pendingTypeCmd4 [ADDR_SPACE] = {0};
+  volatile uint8_t  pendingIdValid  [ADDR_SPACE] = {0};
+  volatile uint8_t  pendingIdCmd4   [ADDR_SPACE] = {0};
+  // Round-robin indices for fair scheduling
+  uint8_t pendingTypeIdx = 0;
+  uint8_t pendingIdIdx   = 0;
 };
 
 // ---------------------------------------------------------------------------

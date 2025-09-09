@@ -158,7 +158,8 @@ void ComProtMaster::update() {
     handleTypeResult(id, tp);
   }
 
-  // 3) prefer WHO over POLL when idle
+  // 3) priority: pending command > WHO > background POLL when idle
+  schedulePendingIfIdle();
   scheduleWhoIfNeeded();
   schedulePollIfIdle();
 
@@ -290,12 +291,20 @@ std::vector<SlaveInfo> ComProtMaster::getSlavesByType(uint8_t type) {
 bool ComProtMaster::isSlaveConnected(uint8_t id) { return findSlave(id) != slaves.end(); }
 
 bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t cmd) {
-  buildFrameAndKick(CMD_TO_TYPE, slaveType & 0x3F, cmd & 0x0F, RESP_NONE);
+  uint8_t idx = (slaveType & 0x3F);
+  noInterrupts();
+  pendingTypeCmd4[idx]  = (cmd & 0x0F);
+  pendingTypeValid[idx] = 1; // newest wins
+  interrupts();
   return true;
 }
 
 bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t cmd) {
-  buildFrameAndKick(CMD_TO_ID, slaveId & 0x3F, cmd & 0x0F, RESP_NONE);
+  uint8_t idx = (slaveId & 0x3F);
+  noInterrupts();
+  pendingIdCmd4[idx]  = (cmd & 0x0F);
+  pendingIdValid[idx] = 1;
+  interrupts();
   return true;
 }
 
@@ -307,6 +316,40 @@ bool ComProtMaster::sendCommandToSlaveType(uint8_t slaveType, uint8_t command, u
 bool ComProtMaster::sendCommandToSlaveId(uint8_t slaveId, uint8_t command, uint8_t* data, uint16_t dataLen) {
   if (dataLen > 0) return false;
   return sendCommandToSlaveId(slaveId, command & 0x0F);
+}
+
+void ComProtMaster::schedulePendingIfIdle() {
+  if (!(respNeed==0 && cellIdx >= txLen)) return;
+
+  // Try one pending-by-ID first (directed commands often imply tighter timing)
+  for (uint8_t i=0; i<ADDR_SPACE; ++i) {
+    uint8_t idx = (pendingIdIdx + i) & 0x3F;
+    if (pendingIdValid[idx]) {
+      uint8_t c4;
+      noInterrupts();
+      c4 = pendingIdCmd4[idx];
+      pendingIdValid[idx] = 0; // consume
+      interrupts();
+      pendingIdIdx = (idx + 1) & 0x3F;
+      buildFrameAndKick(CMD_TO_ID, idx, c4, RESP_NONE);
+      return;
+    }
+  }
+
+  // Then pending-by-type
+  for (uint8_t i=0; i<ADDR_SPACE; ++i) {
+    uint8_t idx = (pendingTypeIdx + i) & 0x3F;
+    if (pendingTypeValid[idx]) {
+      uint8_t c4;
+      noInterrupts();
+      c4 = pendingTypeCmd4[idx];
+      pendingTypeValid[idx] = 0;
+      interrupts();
+      pendingTypeIdx = (idx + 1) & 0x3F;
+      buildFrameAndKick(CMD_TO_TYPE, idx, c4, RESP_NONE);
+      return;
+    }
+  }
 }
 
 // ===================== Slave =====================
